@@ -43,7 +43,7 @@ async function startServer() {
       messages.push({ role: "user", content: message });
 
       const response = await deepseek.chat.completions.create({
-        model: "deepseek-chat",
+        model: "deepseek-v4-flash",
         messages,
         temperature: 0.95,
         max_tokens: 400,
@@ -73,7 +73,7 @@ async function startServer() {
       for (const imgBase64 of images) {
         try {
           const response = await deepseek.chat.completions.create({
-            model: "deepseek-chat",
+            model: "deepseek-v4-flash",
             messages: [
               {
                 role: "user",
@@ -145,7 +145,7 @@ ${materialText}
 只输出系统提示词本体，150字以内。`;
 
       const response = await deepseek.chat.completions.create({
-        model: "deepseek-chat",
+        model: "deepseek-v4-flash",
         messages: [{ role: "user", content: prompt }],
         temperature: 0.7,
         max_tokens: 400,
@@ -167,7 +167,7 @@ ${materialText}
       if (!text) return res.status(400).json({ error: "文本不能为空" });
 
       const response = await deepseek.chat.completions.create({
-        model: "deepseek-chat",
+        model: "deepseek-v4-flash",
         messages: [
           {
             role: "system",
