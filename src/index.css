@@ -1,0 +1,37 @@
+@import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@300..700&family=Inter:wght@300;400;500;600;700&family=Noto+Sans+KR:wght@300;400;500;700;900&family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', 'Noto Sans SC', 'Noto Sans KR', system-ui, -apple-system, sans-serif;
+  --font-cute: 'Fredoka', 'Noto Sans SC', sans-serif;
+  
+  --color-bubble-bg: #849bbb;
+  --color-bubble-yellow: #f7e600;
+  --color-bubble-dark: #2d3032;
+  --color-bubble-gray: rgba(255, 255, 255, 0.15);
+}
+
+/* Custom scrollbar hides but allows scrolling */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none; /* IE and Edge */
+  scrollbar-width: none; /* Firefox */
+}
+
+/* K-pop Bubble style animations and chat scroll behaviors */
+@keyframes bubble-bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
+}
+
+.animate-pulse-slow {
+  animation: pulse 2.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Pulse keyframe */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .6; }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Bubble DM Simulator",
+  "description": "一种专为粉丝定制的、高仿 Bubble / Weverse DM 的爱豆互动模拟平台。依托 Gemini 3.5 智能微调角色扮演，提供甜度拉满的聊天体验与双语（韩文原文/中文翻译）实时对齐展示。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
