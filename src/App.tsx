@@ -198,12 +198,33 @@ export default function App() {
         material = data.text || "";
       }
 
-      // Step 3
+      // Step 3 — 从素材里猜爱豆名字
       setProgressStep(3);
-      setProgressLabel("分析说话风格…");
-      await sleep(400);
+      setProgressLabel("识别爱豆名字…");
 
-      // Step 4 — Distill via API
+      if (material.trim()) {
+        try {
+          const nameRes = await fetch("/api/distill", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              idolName: "__detect__",
+              material,
+              detectNameOnly: true,
+            }),
+          });
+          const nameData = await nameRes.json();
+          if (nameData.idolName && nameData.idolName !== "__detect__") {
+            setSetupName(nameData.idolName);
+          }
+        } catch {
+          // 猜不出来没关系，用户手动填
+        }
+      }
+
+      await sleep(300);
+
+      // Step 4 — Distill
       setProgressStep(4);
       setProgressLabel("生成专属 SKILL…");
 
@@ -256,10 +277,12 @@ export default function App() {
         body: JSON.stringify({ message: userMsg.text, history: messages, systemPrompt: currentIdol.systemPrompt }),
       });
       const data = await res.json();
+      const idolMsgId = genId();
       setMessages((prev) => {
         const updated = prev.map((m) => m.id === userMsg.id ? { ...m, isUnread: false } : m);
-        return [...updated, { id: genId(), sender: "idol" as const, text: data.text || "...", time: formatTime() }];
+        return [...updated, { id: idolMsgId, sender: "idol" as const, text: data.text || "...", time: formatTime(), showTranslation: false }];
       });
+      autoTranslate(idolMsgId, data.text || "");
     } catch {
       setMessages((prev) => prev.map((m) => m.id === userMsg.id ? { ...m, isUnread: false } : m));
     } finally {
@@ -267,8 +290,8 @@ export default function App() {
     }
   }
 
-  async function translateMessage(msgId: string, text: string) {
-    setMessages((prev) => prev.map((m) => m.id === msgId ? { ...m, translation: "翻译中…", showTranslation: true } : m));
+  // 爱豆消息发出后立即自动翻译，默认显示中文译文
+  async function autoTranslate(msgId: string, text: string) {
     try {
       const res = await fetch("/api/translate", {
         method: "POST",
@@ -276,14 +299,22 @@ export default function App() {
         body: JSON.stringify({ text }),
       });
       const data = await res.json();
-      setMessages((prev) => prev.map((m) => m.id === msgId ? { ...m, translation: data.translated || "翻译失败", showTranslation: true } : m));
+      // showTranslation: true = 显示译文（默认）
+      setMessages((prev) => prev.map((m) =>
+        m.id === msgId
+          ? { ...m, translation: data.translated || text, showTranslation: true }
+          : m
+      ));
     } catch {
-      setMessages((prev) => prev.map((m) => m.id === msgId ? { ...m, translation: "翻译失败" } : m));
+      // 翻译失败就直接显示原文
     }
   }
 
+  // 点「查看原文」切换显示原文/译文
   function toggleTranslation(msgId: string) {
-    setMessages((prev) => prev.map((m) => m.id === msgId ? { ...m, showTranslation: !m.showTranslation } : m));
+    setMessages((prev) => prev.map((m) =>
+      m.id === msgId ? { ...m, showTranslation: !m.showTranslation } : m
+    ));
   }
 
   function deleteIdol(id: string) {
@@ -612,17 +643,18 @@ export default function App() {
                   )}
                   <div style={{ display: "flex", alignItems: "flex-end", gap: 6 }}>
                     <div style={{ background: idolBg, color: "#111", padding: "10px 14px", borderRadius: "4px 18px 18px 18px", fontSize: 14, lineHeight: 1.55, border: isBubble ? "0.5px solid #eee" : "none", maxWidth: 240, boxShadow: isBubble ? "0 1px 2px rgba(0,0,0,0.06)" : "none" }}>
-                      {msg.text}
+                      {/* 默认显示译文，showTranslation=false 时显示原文 */}
+                      {msg.showTranslation === false
+                        ? msg.text
+                        : (msg.translation || msg.text)
+                      }
                     </div>
                     <span style={{ fontSize: 10, color: "#bbb", whiteSpace: "nowrap", paddingBottom: 2 }}>{msg.time}</span>
                   </div>
-                  {msg.showTranslation && msg.translation && (
-                    <div style={{ fontSize: 12, color: accent, fontStyle: "italic", marginTop: 2, paddingLeft: 2 }}>{msg.translation}</div>
-                  )}
-                  <button onClick={() => msg.translation ? toggleTranslation(msg.id) : translateMessage(msg.id, msg.text)}
+                  <button onClick={() => toggleTranslation(msg.id)}
                     style={{ display: "flex", alignItems: "center", gap: 3, background: "none", border: "none", cursor: "pointer", padding: "2px 0", fontSize: 11, color: "#aaa" }}>
                     <RefreshCw size={10} />
-                    {isBubble ? "查看翻译" : "查看原文"}
+                    {msg.showTranslation === false ? "查看译文" : "查看原文"}
                   </button>
                 </div>
               </div>
