@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from "react";
 import {
   ArrowLeft, Search, MoreVertical, Send, Plus,
-  Trash2, Camera, X, Check, ChevronRight, RefreshCw, Heart
+  Trash2, Camera, X, Check, ChevronRight, RefreshCw, Heart,
+  Bell, Star, Grid, Settings
 } from "lucide-react";
 import Tesseract from "tesseract.js";
 
@@ -104,6 +105,12 @@ export default function App() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const avatarInputRef = useRef<HTMLInputElement>(null);
+  const bgInputRef = useRef<HTMLInputElement>(null);
+
+  // 聊天页 UI 状态
+  const [showDrawer, setShowDrawer] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [chatBgImage, setChatBgImage] = useState<string>("");
 
   useEffect(() => { saveIdols(idols); }, [idols]);
   useEffect(() => { if (currentIdol) saveHistory(currentIdol.id, messages); }, [messages, currentIdol]);
@@ -114,12 +121,62 @@ export default function App() {
   function openChat(idol: Idol) {
     setCurrentIdol(idol);
     const hist = loadHistory(idol.id);
-    if (hist.length === 0) {
-      setMessages([{ id: genId(), sender: "idol", text: "안녕~ 나야 나! 보고 싶었어 🫶", time: formatTime() }]);
-    } else {
-      setMessages(hist);
-    }
+    setMessages(hist);
     setScreen("chat");
+    // 每次进入都触发爱豆主动连发消息
+    setTimeout(() => triggerIdolGreeting(idol, hist), 300);
+  }
+
+  async function triggerIdolGreeting(idol: Idol, existingHistory: Message[]) {
+    const todayKey = `greeting_${idol.id}_${new Date().toDateString()}`;
+    const alreadySent = localStorage.getItem(todayKey);
+
+    const prompt = alreadySent
+      ? `你是K-pop偶像「${idol.name}」，粉丝刚刚打开了你的专属频道。
+你们今天已经聊过了，现在是再次上线。
+像真实 Bubble 那样连续发消息，发5-10条，每条都很短（1-2句），有的就是一个emoji或一个感叹词。
+表达看到粉丝在线的开心，随便聊聊你现在在做什么。
+每条消息单独一行，直接输出，不要编号，韩文为主。`
+      : `你是K-pop偶像「${idol.name}」，粉丝刚打开你的专属频道。
+像真实 Bubble 那样疯狂连发消息，发10-20条，每条都极短（有时就一个词、一个emoji、一串ㅋㅋㅋ）。
+内容随意自然：打招呼、问粉丝在干嘛、说说你今天发生的事、突然问一个问题、发个无厘头的感叹。
+节奏要有真实感，像人在手机上一条一条快速发。
+每条消息单独一行，直接输出，不要编号，韩文为主。`;
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: "__greeting__",
+          history: [],
+          systemPrompt: idol.systemPrompt + "\n\n" + prompt,
+        }),
+      });
+      const data = await res.json();
+      if (!data.text) return;
+
+      const lines = data.text
+        .split("\n")
+        .map((l: string) => l.trim())
+        .filter((l: string) => l.length > 0);
+
+      for (let i = 0; i < lines.length; i++) {
+        // 短消息间隔短，长消息间隔稍长，模拟真实打字节奏
+        const delay = lines[i].length < 5 ? 400 : lines[i].length < 15 ? 700 : 1000;
+        await sleep(i === 0 ? 500 : delay);
+        const msgId = genId();
+        setMessages((prev) => [
+          ...prev,
+          { id: msgId, sender: "idol" as const, text: lines[i], time: formatTime(), showTranslation: false },
+        ]);
+        autoTranslate(msgId, lines[i]);
+      }
+
+      localStorage.setItem(todayKey, "1");
+    } catch (e) {
+      console.warn("greeting 失败:", e);
+    }
   }
 
   function goHome() {
@@ -347,7 +404,6 @@ export default function App() {
   // ── Home ─────────────────────────────────────────────────────
   if (screen === "home") return (
     <div style={S.frame}>
-      <StatusBar />
       <div style={S.homeNav}>
         <span style={{ fontSize: 18, fontWeight: 500, color: "#111" }}>消息</span>
         <button onClick={startDistill} style={S.iconBtn} aria-label="添加"><Plus size={22} color="#555" /></button>
@@ -388,7 +444,6 @@ export default function App() {
 
     return (
       <div style={S.frame}>
-        <StatusBar />
         <div style={S.navBar}>
           <button onClick={goHome} style={S.iconBtn}><ArrowLeft size={20} color="#333" /></button>
           <span style={S.navTitle}>蒸馏爱豆</span>
@@ -481,7 +536,6 @@ export default function App() {
 
     return (
       <div style={{ ...S.frame, position: "relative" }}>
-        <StatusBar />
         <div style={S.navBar}>
           <div style={{ width: 32 }} />
           <span style={S.navTitle}>蒸馏中</span>
@@ -594,30 +648,23 @@ export default function App() {
     const accent = isBubble ? "#7C6FD4" : "#5CC8C2";
     const idolBg = isBubble ? "#FFFFFF" : "#A8E6E2";
     const userBg = "#F0F0F0";
+    const chatBg = chatBgImage
+      ? undefined
+      : "#F7F7F7";
 
     return (
       <div style={{ ...S.frame, background: "#F7F7F7" }}>
-        <StatusBar />
 
         <div style={{ ...S.navBar, background: "#fff", borderBottom: "0.5px solid #eee" }}>
           <button onClick={goHome} style={S.iconBtn}><ArrowLeft size={20} color="#333" /></button>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, justifyContent: "center" }}>
-            <Avatar idol={currentIdol} size={32} />
-            <span style={{ fontSize: 15, fontWeight: 500, color: "#111" }}>{currentIdol.name}</span>
-            {isBubble
-              ? <span style={{ fontSize: 9, background: accent, color: "#fff", borderRadius: 10, padding: "1px 5px", fontWeight: 600 }}>ARTIST</span>
-              : <span style={{ color: accent, fontSize: 14 }}>✓</span>
-            }
-          </div>
+          <span style={{ fontSize: 16, fontWeight: 700, color: "#111", flex: 1, textAlign: "center" }}>
+            {currentIdol.name}
+          </span>
           <div style={{ display: "flex", gap: 4 }}>
-            {!isBubble && (
-              <div style={{ display: "flex", alignItems: "center", gap: 3, background: "#f0f0f0", borderRadius: 20, padding: "3px 8px" }}>
-                <Heart size={11} fill={accent} color={accent} />
-                <span style={{ fontSize: 11, color: "#555", fontWeight: 500 }}>+84</span>
-              </div>
-            )}
-            <button style={S.iconBtn}><Search size={18} color="#555" /></button>
-            <button style={S.iconBtn}><MoreVertical size={18} color="#555" /></button>
+            <button style={S.iconBtn} aria-label="通知"><Bell size={20} color="#333" /></button>
+            <button style={S.iconBtn} aria-label="菜单" onClick={() => setShowDrawer(true)}>
+              <Star size={20} color="#f5c518" fill="#f5c518" />
+            </button>
           </div>
         </div>
 
@@ -628,7 +675,8 @@ export default function App() {
           </div>
         )}
 
-        <div style={{ flex: 1, overflowY: "auto", padding: "12px", display: "flex", flexDirection: "column", gap: 12 }}>
+        {/* 聊天消息区 */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "12px", display: "flex", flexDirection: "column", gap: 12, background: chatBg, backgroundImage: chatBgImage ? `url(${chatBgImage})` : undefined, backgroundSize: "cover", backgroundPosition: "center" }}>
           {messages.map((msg) => {
             if (msg.sender === "idol") return (
               <div key={msg.id} style={{ display: "flex", alignItems: "flex-start", gap: 8, paddingRight: 48 }}>
@@ -643,19 +691,23 @@ export default function App() {
                   )}
                   <div style={{ display: "flex", alignItems: "flex-end", gap: 6 }}>
                     <div style={{ background: idolBg, color: "#111", padding: "10px 14px", borderRadius: "4px 18px 18px 18px", fontSize: 14, lineHeight: 1.55, border: isBubble ? "0.5px solid #eee" : "none", maxWidth: 240, boxShadow: isBubble ? "0 1px 2px rgba(0,0,0,0.06)" : "none" }}>
-                      {/* 默认显示译文，showTranslation=false 时显示原文 */}
-                      {msg.showTranslation === false
-                        ? msg.text
-                        : (msg.translation || msg.text)
-                      }
+                      {msg.showTranslation === false ? msg.text : (msg.translation || msg.text)}
                     </div>
                     <span style={{ fontSize: 10, color: "#bbb", whiteSpace: "nowrap", paddingBottom: 2 }}>{msg.time}</span>
+                    {/* A 翻译圆形按钮 */}
+                    <button
+                      onClick={() => toggleTranslation(msg.id)}
+                      title={msg.showTranslation === false ? "查看译文" : "查看原文"}
+                      style={{
+                        width: 24, height: 24, borderRadius: "50%",
+                        background: "#f0f0f0", border: "0.5px solid #ddd",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        cursor: "pointer", flexShrink: 0, paddingBottom: 2,
+                        fontSize: 11, fontWeight: 700, color: "#666",
+                      }}>
+                      A
+                    </button>
                   </div>
-                  <button onClick={() => toggleTranslation(msg.id)}
-                    style={{ display: "flex", alignItems: "center", gap: 3, background: "none", border: "none", cursor: "pointer", padding: "2px 0", fontSize: 11, color: "#aaa" }}>
-                    <RefreshCw size={10} />
-                    {msg.showTranslation === false ? "查看译文" : "查看原文"}
-                  </button>
                 </div>
               </div>
             );
@@ -681,10 +733,10 @@ export default function App() {
               </div>
             </div>
           )}
-
           <div ref={messagesEndRef} />
         </div>
 
+        {/* 输入栏 */}
         <div style={{ background: "#fff", borderTop: "0.5px solid #eee", padding: "8px 12px 20px", display: "flex", alignItems: "center", gap: 8 }}>
           <input type="text" value={inputText}
             onChange={(e) => setInputText(e.target.value)}
@@ -693,11 +745,171 @@ export default function App() {
             style={{ flex: 1, background: "#F7F7F7", border: "0.5px solid #eee", borderRadius: 24, padding: "10px 16px", fontSize: 14, color: "#111", outline: "none", fontFamily: "inherit" }}
             disabled={isLoading} />
           <button onClick={() => sendMessage()} disabled={!inputText.trim() || isLoading}
-            style={{ width: 38, height: 38, borderRadius: "50%", background: inputText.trim() && !isLoading ? accent : "#eee", border: "none", cursor: inputText.trim() && !isLoading ? "pointer" : "not-allowed", display: "flex", alignItems: "center", justifyContent: "center", transition: "background .15s" }}
+            style={{ width: 38, height: 38, borderRadius: "50%", background: inputText.trim() && !isLoading ? accent : "#eee", border: "none", cursor: inputText.trim() && !isLoading ? "pointer" : "not-allowed", display: "flex", alignItems: "center", justifyContent: "center" }}
             aria-label="发送">
             <Send size={16} color={inputText.trim() && !isLoading ? "#fff" : "#bbb"} />
           </button>
         </div>
+
+        {/* 右侧抽屉 — 对应第二张截图 */}
+        {showDrawer && (
+          <div style={{ position: "absolute", inset: 0, zIndex: 40, display: "flex" }} onClick={() => setShowDrawer(false)}>
+            <div style={{ flex: 1, background: "rgba(0,0,0,0.3)" }} />
+            <div style={{ width: "75%", background: "#fff", display: "flex", flexDirection: "column" }} onClick={(e) => e.stopPropagation()}>
+              {/* 抽屉顶部 */}
+              <div style={{ padding: "16px 16px 8px", display: "flex", justifyContent: "flex-end", gap: 12, borderBottom: "0.5px solid #eee" }}>
+                <button style={S.iconBtn}><Bell size={20} color="#333" /></button>
+                <button style={S.iconBtn}><Star size={20} color="#f5c518" fill="#f5c518" /></button>
+              </div>
+
+              {/* me 行 */}
+              <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "16px" }}>
+                <div style={{ width: 44, height: 44, borderRadius: "50%", background: "#333", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 12, fontWeight: 500 }}>me</div>
+                <span style={{ fontSize: 15, color: "#111" }}>T_T</span>
+              </div>
+
+              {/* 爱豆行 */}
+              <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "0 16px 16px", borderBottom: "0.5px solid #eee" }}>
+                <div style={{ position: "relative" }}>
+                  <Avatar idol={currentIdol} size={44} />
+                  <span style={{ position: "absolute", top: -4, left: -4, fontSize: 8, background: accent, color: "#fff", borderRadius: 8, padding: "1px 4px", fontWeight: 600 }}>ARTIST</span>
+                </div>
+                <span style={{ fontSize: 15, color: "#111" }}>{currentIdol.name}</span>
+              </div>
+
+              {/* OUR BOX */}
+              <div style={{ margin: 16, background: "#EEF6FF", borderRadius: 12, padding: "14px 16px", display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 20 }}>🏷️</span>
+                <span style={{ fontSize: 14, fontWeight: 500, color: "#111" }}>OUR BOX</span>
+              </div>
+
+              {/* 底部操作 */}
+              <div style={{ marginTop: "auto", borderTop: "0.5px solid #eee", padding: "12px 16px", display: "flex", justifyContent: "space-around" }}>
+                <button onClick={() => { setShowDrawer(false); setShowSettings(true); }} style={{ ...S.iconBtn, flexDirection: "column" as any, gap: 4, fontSize: 10, color: "#555" }}>
+                  <Grid size={22} color="#555" />
+                  设置
+                </button>
+                <button style={{ ...S.iconBtn, flexDirection: "column" as any, gap: 4, fontSize: 10, color: "#555" }}>
+                  <Settings size={22} color="#555" />
+                  管理
+                </button>
+              </div>
+              <div style={{ padding: "0 16px 24px", textAlign: "right" }}>
+                <button onClick={goHome} style={{ fontSize: 13, color: "#888", background: "none", border: "none", cursor: "pointer" }}>退出聊天室 →</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 设置页 — 对应第一张截图 */}
+        {showSettings && (
+          <div style={{ position: "absolute", inset: 0, zIndex: 50, background: "#fff", display: "flex", flexDirection: "column" }}>
+            <div style={{ ...S.navBar, borderBottom: "0.5px solid #eee" }}>
+              <button onClick={() => setShowSettings(false)} style={S.iconBtn}><ArrowLeft size={20} color="#333" /></button>
+              <span style={{ fontSize: 16, fontWeight: 700, color: "#111" }}>设置聊天室</span>
+              <div style={{ width: 32 }} />
+            </div>
+
+            <div style={{ flex: 1, overflowY: "auto" }}>
+              {/* 聊天室名称 */}
+              <div style={S.settingRow}>
+                <span style={S.settingLabel}>聊天室名称</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 14, color: accent }}>{currentIdol.name}</span>
+                  <ChevronRight size={16} color="#ccc" />
+                </div>
+              </div>
+
+              {/* 设置爱称 */}
+              <div style={S.settingRow}>
+                <div>
+                  <div style={S.settingLabel}>设置爱称</div>
+                  <div style={{ fontSize: 11, color: "#aaa", marginTop: 2 }}>您可以设置 ARTIST 称呼您的爱称。</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 13, color: "#aaa" }}>OFF</span>
+                  <ChevronRight size={16} color="#ccc" />
+                </div>
+              </div>
+
+              <div style={{ height: 8, background: "#f5f5f5" }} />
+
+              {/* 设置背景 */}
+              <div style={S.settingRow} onClick={() => bgInputRef.current?.click()}>
+                <span style={S.settingLabel}>设置背景</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {chatBgImage && <div style={{ width: 24, height: 24, borderRadius: 4, background: `url(${chatBgImage}) center/cover`, border: "0.5px solid #eee" }} />}
+                  <ChevronRight size={16} color="#ccc" />
+                </div>
+              </div>
+              <input type="file" ref={bgInputRef} accept="image/*" style={{ display: "none" }}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = () => setChatBgImage(reader.result as string);
+                  reader.readAsDataURL(file);
+                }} />
+
+              {/* 设置 ARTIST 徽章 */}
+              <div style={S.settingRow}>
+                <span style={S.settingLabel}>设置 ARTIST 徽章</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 13, color: accent, fontWeight: 500 }}>ON</span>
+                  <ChevronRight size={16} color="#ccc" />
+                </div>
+              </div>
+
+              {/* 设置 bubble FONT 效果 */}
+              <div style={S.settingRow}>
+                <span style={S.settingLabel}>设置 bubble FONT 效果</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 13, color: accent, fontWeight: 500 }}>ON</span>
+                  <ChevronRight size={16} color="#ccc" />
+                </div>
+              </div>
+
+              <div style={{ height: 8, background: "#f5f5f5" }} />
+
+              {/* 翻译 */}
+              <div style={S.settingRow}>
+                <span style={S.settingLabel}>翻译</span>
+                <div style={{ width: 24, height: 24, borderRadius: 4, background: accent, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <Check size={14} color="#fff" />
+                </div>
+              </div>
+
+              {/* 目标翻译语言 */}
+              <div style={S.settingRow}>
+                <div>
+                  <div style={S.settingLabel}>目标翻译语言</div>
+                  <div style={{ fontSize: 11, color: "#aaa", marginTop: 2 }}>不支持泡状框内 1,000 字以上聊天内容的翻译。</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 13, color: accent }}>中文 (简体)</span>
+                  <ChevronRight size={16} color="#ccc" />
+                </div>
+              </div>
+
+              {/* 翻译软件 */}
+              <div style={S.settingRow}>
+                <div>
+                  <div style={S.settingLabel}>翻译软件</div>
+                  <div style={{ fontSize: 11, color: "#aaa", marginTop: 2, lineHeight: 1.5 }}>设置翻译软件后，共同适用于设置相同目标翻译语言的 bubble 聊天室。</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 13, color: accent }}>DeepSeek</span>
+                  <ChevronRight size={16} color="#ccc" />
+                </div>
+              </div>
+            </div>
+
+            {/* 退出按钮 */}
+            <button onClick={goHome} style={{ margin: 16, padding: "14px", borderRadius: 0, border: "none", background: accent, color: "#fff", fontSize: 15, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>
+              退出聊天室
+            </button>
+          </div>
+        )}
 
         <style>{`@keyframes bounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-6px)} }`}</style>
       </div>
@@ -741,4 +953,6 @@ const S: Record<string, React.CSSProperties> = {
   card: { background: "#fff", borderRadius: 20, padding: "24px 20px", width: "100%", maxWidth: 360 },
   label: { fontSize: 12, color: "#888", marginBottom: 6, fontWeight: 500 },
   fieldInput: { width: "100%", padding: "11px 14px", borderRadius: 12, border: "0.5px solid #ddd", background: "#fafafa", color: "#111", fontSize: 14, fontFamily: "inherit", outline: "none", boxSizing: "border-box" },
+  settingRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 16px", borderBottom: "0.5px solid #f0f0f0", cursor: "pointer" },
+  settingLabel: { fontSize: 15, color: "#111" },
 };
