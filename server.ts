@@ -6,6 +6,7 @@ import OpenAI from "openai";
 import { exec } from "child_process";
 import { promisify } from "util";
 import fs from "fs";
+import Tesseract from "tesseract.js";
 
 dotenv.config();
 const execAsync = promisify(exec);
@@ -22,7 +23,6 @@ async function startServer() {
   });
 
   // ── /api/chat ──────────────────────────────────────────────
-  // 普通对话，用蒸馏出的 systemPrompt 驱动爱豆回复
   app.post("/api/chat", async (req, res) => {
     try {
       const { message, history, systemPrompt } = req.body;
@@ -32,7 +32,6 @@ async function startServer() {
         { role: "system", content: systemPrompt || "你是一个温柔的K-pop偶像，正在和粉丝聊天。" },
       ];
 
-      // 最近 15 条历史
       const recent = (history || []).slice(-15);
       for (const m of recent) {
         messages.push({
@@ -59,11 +58,10 @@ async function startServer() {
   });
 
   // ── /api/ocr ───────────────────────────────────────────────
-  // 接收 base64 图片数组，逐张提取爱豆发言文字
-  // 使用 DeepSeek-VL（vision）或 fallback 到纯文字描述提取
+  // tesseract.js 读取截图文字，支持韩语+中文
   app.post("/api/ocr", async (req, res) => {
     try {
-      const { images } = req.body; // string[] base64 with data URI
+      const { images } = req.body;
       if (!images || !Array.isArray(images) || images.length === 0) {
         return res.status(400).json({ error: "请上传至少一张图片" });
       }
@@ -72,30 +70,13 @@ async function startServer() {
 
       for (const imgBase64 of images) {
         try {
-          const response = await deepseek.chat.completions.create({
-            model: "deepseek-v4-flash",
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "image_url",
-                    image_url: { url: imgBase64 },
-                  } as any,
-                  {
-                    type: "text",
-                    text: `这是一张韩国偶像平台（Bubble/Weverse）的聊天截图。
-请只提取【爱豆/ARTIST发出的消息文字】，不要提取粉丝的消息、时间戳、UI按钮文字、"查看原文"等。
-直接输出爱豆的原话，多条消息用换行分隔，不要加任何解释或编号。
-如果看不清楚或没有爱豆消息，输出空字符串。`,
-                  },
-                ],
-              },
-            ],
-            max_tokens: 500,
-          });
-          const text = response.choices[0]?.message?.content?.trim() || "";
-          if (text) results.push(text);
+          const { data: { text } } = await Tesseract.recognize(
+            imgBase64,
+            "kor+chi_sim", // 韩语 + 简体中文
+            { logger: () => {} }
+          );
+          const cleaned = text.trim();
+          if (cleaned) results.push(cleaned);
         } catch (imgErr) {
           console.warn("单张图片 OCR 失败，跳过:", imgErr);
         }
@@ -110,7 +91,6 @@ async function startServer() {
   });
 
   // ── /api/distill ───────────────────────────────────────────
-  // 接收素材文字+爱豆名，输出蒸馏后的 systemPrompt
   app.post("/api/distill", async (req, res) => {
     try {
       const { idolName, material } = req.body;
@@ -160,7 +140,6 @@ ${materialText}
   });
 
   // ── /api/translate ─────────────────────────────────────────
-  // 点「查看原文」/ A 按钮时调用，翻译韩文到中文
   app.post("/api/translate", async (req, res) => {
     try {
       const { text } = req.body;
@@ -188,7 +167,6 @@ ${materialText}
   });
 
   // ── /api/subtitle ──────────────────────────────────────────
-  // yt-dlp 下载 YouTube 字幕
   app.post("/api/subtitle", async (req, res) => {
     try {
       const { url } = req.body;
@@ -197,24 +175,20 @@ ${materialText}
       const tmpDir = `/tmp/yt_${Date.now()}`;
       fs.mkdirSync(tmpDir, { recursive: true });
 
-      // 尝试下载字幕
       const cmd = `yt-dlp --write-auto-sub --sub-lang ko,ja,zh-Hans --skip-download --output "${tmpDir}/%(id)s" "${url}" 2>&1`;
       await execAsync(cmd).catch(() => null);
 
-      // 读取所有 vtt 文件
       const files = fs.readdirSync(tmpDir).filter((f) => f.endsWith(".vtt") || f.endsWith(".srt"));
       if (files.length === 0) {
         fs.rmSync(tmpDir, { recursive: true });
         return res.status(404).json({ error: "未找到字幕，请尝试粘贴文字素材" });
       }
 
-      // 清洗 vtt 格式
       let rawText = "";
       for (const f of files) {
         rawText += fs.readFileSync(path.join(tmpDir, f), "utf-8") + "\n";
       }
 
-      // 去掉时间戳行、WEBVTT头、空行，去重
       const lines = rawText
         .split("\n")
         .filter((l) => l.trim())
