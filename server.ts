@@ -2,98 +2,239 @@ import express from "express";
 import path from "path";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI } from "@google/genai";
+import OpenAI from "openai";
+import { exec } from "child_process";
+import { promisify } from "util";
+import fs from "fs";
 
 dotenv.config();
+const execAsync = promisify(exec);
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: "20mb" }));
 
-  // Initialize server-side Gemini client
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.warn("WARNING: GEMINI_API_KEY is not defined in environment variables. Please configure it in your Secrets.");
-  }
-
-  const ai = new GoogleGenAI({
-    apiKey: apiKey || "",
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      }
-    }
+  const deepseek = new OpenAI({
+    apiKey: process.env.DEEPSEEK_API_KEY || "",
+    baseURL: "https://api.deepseek.com",
   });
 
-  // REST API Routes
+  // ── /api/chat ──────────────────────────────────────────────
+  // 普通对话，用蒸馏出的 systemPrompt 驱动爱豆回复
   app.post("/api/chat", async (req, res) => {
     try {
-      const { message, history, idolName, idolPersonality, systemInstruction } = req.body;
-      if (!message) {
-        res.status(400).json({ error: "消息不能为空" });
-        return;
+      const { message, history, systemPrompt } = req.body;
+      if (!message) return res.status(400).json({ error: "消息不能为空" });
+
+      const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+        { role: "system", content: systemPrompt || "你是一个温柔的K-pop偶像，正在和粉丝聊天。" },
+      ];
+
+      // 最近 15 条历史
+      const recent = (history || []).slice(-15);
+      for (const m of recent) {
+        messages.push({
+          role: m.sender === "user" ? "user" : "assistant",
+          content: m.text,
+        });
       }
+      messages.push({ role: "user", content: message });
 
-      const defaultSystem = `你现在是K-pop人气男团/女团顶流爱豆“${idolName}”。你正在和一位非常喜欢你、守护着你的粉丝在 Bubble / Weverse DM 空间聊天。
-爱豆性格设定: ${idolPersonality || "极其温柔、非常宠粉和体贴、偶尔调皮可爱，爱用小波浪~和k-pop经典爱豆Emoji"}。你的言辞富有亲和力、真实自然、像最贴心的朋友或深爱的人。
-请务必使用韩国爱豆在独家社群发送消息的半语口吻 (casual Korean, 韩国粉丝最爱的 banmal，如 "~어/아", "~구", "ㅎㅎ", "ㅠㅠ", "💖", "🫶")。
-
-【硬性对齐翻译规则】
-为了支持双语精美展示，你在每一次回复时都必须包含“韩文原文”和“中文翻译”两部分，并用三个连字符（'---'）独占一行进行分割。
-格式规范：
-[韩文原文：原汁原味的、元气满满的、极具韩国爱豆语气，加入大量撒娇与关心细节]
----
-[中文翻译：精妙地、极其传神地输出中文译本，保留那种蜜糖浓度、贴心撒娇语境，千万不要像机器翻译，要让粉丝的心融化。]
-
-示例模板：
-오늘 하루도 수고했어! 너무 보고 싶다... 💖
----
-今天一天也辛苦啦！真的好想你哦... 💖
-
-请严格执行这个格式，直接输出这二者，千万不要用任何 Markdown 代码包含符号（如 \`\`\`typescript 或 \`\`\`json ），且不要有外部多余闲聊，必须纯粹是原汁原味的爱豆发出来的双语信息。`;
-
-      const systemPrompt = systemInstruction || defaultSystem;
-
-      // Map chat history for @google/genai
-      const contents = [];
-      if (history && Array.isArray(history)) {
-        // Send up to last 15 messages to preserve idol chat context
-        const recentHistory = history.slice(-15);
-        for (const msg of recentHistory) {
-          const role = msg.sender === 'user' ? 'user' : 'model';
-          contents.push({
-            role: role,
-            parts: [{ text: msg.text }]
-          });
-        }
-      }
-
-      contents.push({
-        role: 'user',
-        parts: [{ text: message }]
+      const response = await deepseek.chat.completions.create({
+        model: "deepseek-chat",
+        messages,
+        temperature: 0.95,
+        max_tokens: 400,
+        stream: false,
       });
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: contents,
-        config: {
-          systemInstruction: systemPrompt,
-          temperature: 0.95,
-          topP: 0.9,
-        }
-      });
-
-      const text = response.text || "回复生成失败，请稍后重试 ㅠㅠ";
+      const text = response.choices[0]?.message?.content || "ㅠㅠ 잠깐만요...";
       res.json({ text });
     } catch (err: any) {
-      console.error("Express App Gemini Error:", err);
-      res.status(500).json({ error: err.message || "服务器开小差了 ㅠㅠ" });
+      console.error("/api/chat error:", err);
+      res.status(500).json({ error: err.message });
     }
   });
 
-  // Handle Vite Dev Server or Production Build
+  // ── /api/ocr ───────────────────────────────────────────────
+  // 接收 base64 图片数组，逐张提取爱豆发言文字
+  // 使用 DeepSeek-VL（vision）或 fallback 到纯文字描述提取
+  app.post("/api/ocr", async (req, res) => {
+    try {
+      const { images } = req.body; // string[] base64 with data URI
+      if (!images || !Array.isArray(images) || images.length === 0) {
+        return res.status(400).json({ error: "请上传至少一张图片" });
+      }
+
+      const results: string[] = [];
+
+      for (const imgBase64 of images) {
+        try {
+          const response = await deepseek.chat.completions.create({
+            model: "deepseek-chat",
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "image_url",
+                    image_url: { url: imgBase64 },
+                  } as any,
+                  {
+                    type: "text",
+                    text: `这是一张韩国偶像平台（Bubble/Weverse）的聊天截图。
+请只提取【爱豆/ARTIST发出的消息文字】，不要提取粉丝的消息、时间戳、UI按钮文字、"查看原文"等。
+直接输出爱豆的原话，多条消息用换行分隔，不要加任何解释或编号。
+如果看不清楚或没有爱豆消息，输出空字符串。`,
+                  },
+                ],
+              },
+            ],
+            max_tokens: 500,
+          });
+          const text = response.choices[0]?.message?.content?.trim() || "";
+          if (text) results.push(text);
+        } catch (imgErr) {
+          console.warn("单张图片 OCR 失败，跳过:", imgErr);
+        }
+      }
+
+      const combined = results.join("\n").trim();
+      res.json({ text: combined, count: results.length });
+    } catch (err: any) {
+      console.error("/api/ocr error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── /api/distill ───────────────────────────────────────────
+  // 接收素材文字+爱豆名，输出蒸馏后的 systemPrompt
+  app.post("/api/distill", async (req, res) => {
+    try {
+      const { idolName, material } = req.body;
+      if (!idolName) return res.status(400).json({ error: "请填写爱豆名字" });
+
+      const materialText = (material || "").slice(0, 8000);
+
+      const prompt = materialText
+        ? `你是一个偶像人格蒸馏引擎。
+以下是偶像「${idolName}」在 Bubble/Weverse 等粉丝平台发送的真实消息素材：
+
+<material>
+${materialText}
+</material>
+
+请从以上素材中提取这位偶像的对话风格，生成一段角色扮演系统提示词。
+
+要求：
+1. 说话节奏与语气（快/慢/温柔/活泼/傲娇等）
+2. 高频词汇和口头禅（直接引用素材中出现的词）
+3. 常用 emoji 和韩语语气词（ㅎㅎ、ㅠㅠ、~~ 等，从素材中提取）
+4. 对粉丝的称呼和态度
+5. 话题偏好（爱聊什么）
+6. 禁止谈恋爱，保持偶像与粉丝的健康互动距离
+7. 回复简短自然，1-3句为主，像真实平台消息
+
+只输出系统提示词本体，200字以内，不要任何标题或解释。`
+        : `你是一个偶像人格生成引擎。
+请为K-pop偶像「${idolName}」生成一段角色扮演系统提示词。
+风格：温暖、亲切、偶像感，爱用 emoji 和韩语语气词，关心粉丝日常。
+禁止谈恋爱，保持健康互动距离。回复简短自然，1-3句为主。
+只输出系统提示词本体，150字以内。`;
+
+      const response = await deepseek.chat.completions.create({
+        model: "deepseek-chat",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.7,
+        max_tokens: 400,
+      });
+
+      const systemPrompt = response.choices[0]?.message?.content?.trim() || "";
+      res.json({ systemPrompt });
+    } catch (err: any) {
+      console.error("/api/distill error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── /api/translate ─────────────────────────────────────────
+  // 点「查看原文」/ A 按钮时调用，翻译韩文到中文
+  app.post("/api/translate", async (req, res) => {
+    try {
+      const { text } = req.body;
+      if (!text) return res.status(400).json({ error: "文本不能为空" });
+
+      const response = await deepseek.chat.completions.create({
+        model: "deepseek-chat",
+        messages: [
+          {
+            role: "system",
+            content: "你是一个韩中翻译助手。将用户输入的韩文翻译成地道的中文，保留语气和 emoji，不要解释，只输出翻译结果。",
+          },
+          { role: "user", content: text },
+        ],
+        temperature: 0.3,
+        max_tokens: 200,
+      });
+
+      const translated = response.choices[0]?.message?.content?.trim() || "";
+      res.json({ translated });
+    } catch (err: any) {
+      console.error("/api/translate error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── /api/subtitle ──────────────────────────────────────────
+  // yt-dlp 下载 YouTube 字幕
+  app.post("/api/subtitle", async (req, res) => {
+    try {
+      const { url } = req.body;
+      if (!url) return res.status(400).json({ error: "请提供 YouTube 链接" });
+
+      const tmpDir = `/tmp/yt_${Date.now()}`;
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      // 尝试下载字幕
+      const cmd = `yt-dlp --write-auto-sub --sub-lang ko,ja,zh-Hans --skip-download --output "${tmpDir}/%(id)s" "${url}" 2>&1`;
+      await execAsync(cmd).catch(() => null);
+
+      // 读取所有 vtt 文件
+      const files = fs.readdirSync(tmpDir).filter((f) => f.endsWith(".vtt") || f.endsWith(".srt"));
+      if (files.length === 0) {
+        fs.rmSync(tmpDir, { recursive: true });
+        return res.status(404).json({ error: "未找到字幕，请尝试粘贴文字素材" });
+      }
+
+      // 清洗 vtt 格式
+      let rawText = "";
+      for (const f of files) {
+        rawText += fs.readFileSync(path.join(tmpDir, f), "utf-8") + "\n";
+      }
+
+      // 去掉时间戳行、WEBVTT头、空行，去重
+      const lines = rawText
+        .split("\n")
+        .filter((l) => l.trim())
+        .filter((l) => !l.startsWith("WEBVTT"))
+        .filter((l) => !/^\d{2}:\d{2}/.test(l))
+        .filter((l) => !/^NOTE/.test(l))
+        .filter((l) => !/^\d+$/.test(l.trim()));
+
+      const unique = [...new Set(lines)];
+      const cleaned = unique.join("\n").slice(0, 8000);
+
+      fs.rmSync(tmpDir, { recursive: true });
+      res.json({ text: cleaned });
+    } catch (err: any) {
+      console.error("/api/subtitle error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Vite / Static ──────────────────────────────────────────
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -101,15 +242,15 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Express custom server running on http://0.0.0.0:${PORT} in ${process.env.NODE_ENV || "development"} mode.`);
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
 }
 
