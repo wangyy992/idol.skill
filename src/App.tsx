@@ -17,6 +17,7 @@ interface Idol {
   platform: Platform;
   systemPrompt: string;
   createdAt: number;
+  realName?: string; // 现实原型艺名/组合名，用于自动获取行程
 }
 
 interface Message {
@@ -247,6 +248,11 @@ export default function App() {
   const [evtType, setEvtType] = useState<IdolEventType>("comeback");
   const [evtTitle, setEvtTitle] = useState("");
   const [evtDate, setEvtDate] = useState("");
+  // 自动获取行程
+  const [fetchName, setFetchName] = useState("");
+  const [fetching, setFetching] = useState(false);
+  const [suggestions, setSuggestions] = useState<IdolEvent[]>([]);
+  const [setupRealName, setSetupRealName] = useState("");
 
   // 调度器在 setInterval 闭包里跑，用 ref 读取最新的当前爱豆/屏幕
   const currentIdolRef = useRef<Idol | null>(currentIdol);
@@ -370,8 +376,51 @@ export default function App() {
   function openSchedule() {
     if (!currentIdol) return;
     setSchedEvents(loadEvents(currentIdol.id));
+    setFetchName(currentIdol.realName || currentIdol.name);
+    setSuggestions([]);
     setShowDrawer(false);
     setShowSchedule(true);
+  }
+
+  // 自动从日程源抓取该艺人的近期事件（结果作为"建议"，需一键导入）
+  async function autoFetch() {
+    if (!currentIdol || !fetchName.trim()) return;
+    setFetching(true);
+    setSuggestions([]);
+    // 顺手把"现实原名"记到爱豆档案上
+    const rn = fetchName.trim();
+    setIdols((prev) => prev.map((i) => (i.id === currentIdol.id ? { ...i, realName: rn } : i)));
+    setCurrentIdol({ ...currentIdol, realName: rn });
+    try {
+      const r = await fetch("/api/schedule", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ artist: rn }),
+      });
+      const d = await r.json();
+      const evts: IdolEvent[] = (d.events || []).map((e: any) => ({
+        id: genId(),
+        type: (EVENT_META as any)[e.type] ? e.type : "custom",
+        title: e.title || EVENT_META[(e.type as IdolEventType)]?.label || "日程",
+        date: e.date,
+      }));
+      setSuggestions(evts);
+      if (evts.length === 0) alert(d.note || "没找到该艺人的近期行程。换个更准确的原名（如组合英文名），或手动添加。");
+    } catch {
+      alert("获取失败，请稍后再试，或先手动添加。");
+    } finally {
+      setFetching(false);
+    }
+  }
+
+  function importSuggestion(e: IdolEvent) {
+    if (!currentIdol) return;
+    if (schedEvents.some((x) => x.title === e.title && x.date === e.date)) {
+      setSuggestions((prev) => prev.filter((s) => s.id !== e.id));
+      return;
+    }
+    const next = [...schedEvents, e].sort((a, b) => a.date.localeCompare(b.date));
+    setSchedEvents(next);
+    saveEvents(currentIdol.id, next);
+    setSuggestions((prev) => prev.filter((s) => s.id !== e.id));
   }
   function addEvent() {
     if (!currentIdol || !evtDate) return;
@@ -482,6 +531,7 @@ export default function App() {
     setSetupName("");
     setSetupAvatar("");
     setSetupPlatform("bubble");
+    setSetupRealName("");
     setScreen("distill");
   }
 
@@ -597,6 +647,7 @@ export default function App() {
       platform: setupPlatform,
       systemPrompt: pendingSystemPrompt,
       createdAt: Date.now(),
+      realName: setupRealName.trim() || undefined,
     };
     setIdols((prev) => [idol, ...prev]);
     openChat(idol);
@@ -925,6 +976,12 @@ export default function App() {
                 <div style={S.label}>爱豆名字（可含 emoji）</div>
                 <input type="text" value={setupName} onChange={(e) => setSetupName(e.target.value)}
                   placeholder="例如：mocha ☕ 或 令💜" style={S.fieldInput} autoFocus />
+              </div>
+
+              <div style={{ marginBottom: 12 }}>
+                <div style={S.label}>现实原型（选填，用于自动获取回归/演唱会行程）</div>
+                <input type="text" value={setupRealName} onChange={(e) => setSetupRealName(e.target.value)}
+                  placeholder="真实艺名/组合名，例如：IVE、Karina" style={S.fieldInput} />
               </div>
 
               <div style={{ marginBottom: 20 }}>
@@ -1261,7 +1318,45 @@ export default function App() {
                 添加爱豆的回归、演唱会、生日等日程。临近时（D-3 / D-1 / 当天），ta 会主动发相关的消息给你 💜
               </div>
 
-              {/* 添加表单 */}
+              {/* 自动获取行程 */}
+              <div style={{ background: "#F3F1FD", border: "0.5px solid #E1DCF7", borderRadius: 14, padding: 14, marginBottom: 18 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#5B50B0", marginBottom: 8 }}>🔎 自动获取行程</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input type="text" value={fetchName} onChange={(e) => setFetchName(e.target.value)}
+                    placeholder="真实艺名/组合名，如 IVE" style={{ ...S.fieldInput, flex: 1 }} />
+                  <button onClick={autoFetch} disabled={fetching || !fetchName.trim()}
+                    style={{ padding: "0 16px", borderRadius: 12, border: "none", background: fetching || !fetchName.trim() ? "#ccc" : "#7C6FD4", color: "#fff", fontSize: 13, fontWeight: 500, cursor: fetching ? "wait" : "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+                    {fetching ? "获取中…" : "获取"}
+                  </button>
+                </div>
+                <div style={{ fontSize: 11, color: "#9a92c9", marginTop: 6, lineHeight: 1.5 }}>
+                  从公开日程源获取，结果作为建议，确认后再导入。抓不到时可手动添加。
+                </div>
+
+                {suggestions.length > 0 && (
+                  <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                    {suggestions.map((e) => {
+                      const meta = EVENT_META[e.type] || EVENT_META.custom;
+                      const d = daysUntil(e.date);
+                      return (
+                        <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 10, background: "#fff", borderRadius: 10, padding: "8px 10px" }}>
+                          <span style={{ fontSize: 18 }}>{meta.emoji}</span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, color: "#111", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.title}</div>
+                            <div style={{ fontSize: 11, color: "#999" }}>{meta.label} · {e.date}{isNaN(d) ? "" : d >= 0 ? ` · D-${d}` : ""}</div>
+                          </div>
+                          <button onClick={() => importSuggestion(e)}
+                            style={{ padding: "5px 12px", borderRadius: 8, border: "1px solid #7C6FD4", background: "#fff", color: "#5B50B0", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+                            导入
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* 手动添加表单 */}
               <div style={{ background: "#FAFAFA", border: "0.5px solid #eee", borderRadius: 14, padding: 14, marginBottom: 18 }}>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
                   {(Object.keys(EVENT_META) as IdolEventType[]).map((t) => (
