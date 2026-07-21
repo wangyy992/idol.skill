@@ -60,6 +60,131 @@ function saveHistory(idolId: string, msgs: Message[]) {
   localStorage.setItem(`history_${idolId}`, JSON.stringify(msgs.slice(-100)));
 }
 
+// ─── Events & proactive engine ────────────────────────────────────────────────
+
+type IdolEventType = "comeback" | "concert" | "birthday" | "anniversary" | "album" | "variety" | "custom";
+
+interface IdolEvent {
+  id: string;
+  type: IdolEventType;
+  title: string;
+  date: string; // YYYY-MM-DD (local)
+}
+
+const EVENT_META: Record<IdolEventType, { label: string; emoji: string }> = {
+  comeback: { label: "回归", emoji: "🎵" },
+  concert: { label: "演唱会", emoji: "🎤" },
+  birthday: { label: "生日", emoji: "🎂" },
+  anniversary: { label: "纪念日", emoji: "💜" },
+  album: { label: "专辑", emoji: "💿" },
+  variety: { label: "综艺/直播", emoji: "📺" },
+  custom: { label: "日程", emoji: "📌" },
+};
+
+function loadEvents(idolId: string): IdolEvent[] {
+  try { return JSON.parse(localStorage.getItem(`events_${idolId}`) || "[]"); }
+  catch { return []; }
+}
+function saveEvents(idolId: string, evts: IdolEvent[]) {
+  localStorage.setItem(`events_${idolId}`, JSON.stringify(evts));
+}
+
+interface ProactiveState { sent: Record<string, number>; lastAt: number; }
+function loadProactiveState(idolId: string): ProactiveState {
+  try {
+    const s = JSON.parse(localStorage.getItem(`proactive_${idolId}`) || "null");
+    if (s && typeof s === "object") return { sent: s.sent || {}, lastAt: s.lastAt || 0 };
+  } catch {}
+  return { sent: {}, lastAt: 0 };
+}
+function saveProactiveState(idolId: string, s: ProactiveState) {
+  localStorage.setItem(`proactive_${idolId}`, JSON.stringify(s));
+}
+
+function loadUnreadMap(): Record<string, number> {
+  try { return JSON.parse(localStorage.getItem("unread_v1") || "{}"); }
+  catch { return {}; }
+}
+function saveUnreadMap(m: Record<string, number>) {
+  localStorage.setItem("unread_v1", JSON.stringify(m));
+}
+
+function dateKey(ts: number) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+}
+
+// integer day difference: event date − today (local, midnight-based)
+function daysUntil(dateStr: string, now = Date.now()): number {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  if (!y || !m || !d) return NaN;
+  const target = new Date(y, m - 1, d).setHours(0, 0, 0, 0);
+  const today = new Date(now).setHours(0, 0, 0, 0);
+  return Math.round((target - today) / 86400000);
+}
+
+// nearest event that is today or in the future (for the header countdown chip)
+function nextEvent(events: IdolEvent[], now = Date.now()): { e: IdolEvent; d: number } | null {
+  let best: { e: IdolEvent; d: number } | null = null;
+  for (const e of events) {
+    const d = daysUntil(e.date, now);
+    if (isNaN(d) || d < 0) continue;
+    if (!best || d < best.d) best = { e, d };
+  }
+  return best;
+}
+
+interface ProactivePlan { key: string; context: string; min: number; max: number; }
+
+// build a proactive plan for an event on a given day-offset, or null if that offset isn't noteworthy
+function eventPlan(e: IdolEvent, d: number): ProactivePlan | null {
+  const meta = EVENT_META[e.type] || EVENT_META.custom;
+  const tag = `【${meta.label}·${e.title}】`;
+  const mk = (context: string, min = 2, max = 5): ProactivePlan => ({ key: `event_${e.id}_${d}`, context, min, max });
+  if (d === 3) return mk(`还有3天就是你的${tag}，你既紧张又期待，提前跟粉丝预告，让ta一定要关注、别错过。`);
+  if (d === 1) return mk(`明天就是你的${tag}！你超级激动，跟粉丝倒计时，让ta做好准备。`);
+  if (d === 0) {
+    if (e.type === "concert") return mk(`今天是你的演唱会${tag}！你在后台/彩排，兴奋地告诉粉丝，问ta来现场了吗、有没有看直播。`);
+    if (e.type === "comeback" || e.type === "album") return mk(`今天你${tag}正式回归/发新歌！你紧张又开心，求粉丝去听、去看打歌舞台、帮忙冲榜。`);
+    if (e.type === "birthday") return mk(`今天是你的生日${tag}，你在收粉丝的祝福，撒娇又感动地谢谢粉丝。`);
+    return mk(`今天是你的${tag}，你很兴奋地跟粉丝分享这件事。`);
+  }
+  if (d === -1 && (e.type === "comeback" || e.type === "concert" || e.type === "album"))
+    return mk(`昨天是你的${tag}，你还在回味昨天的舞台/现场，谢谢粉丝的应援，问ta觉得怎么样。`);
+  return null;
+}
+
+const CTX_MORNING = "现在是早上，你刚开始新的一天，温柔地跟粉丝道早安，问ta睡得好不好、今天有什么安排。";
+const CTX_NIGHT = "现在是深夜，你准备睡了，跟粉丝道晚安，说点暖心的话。";
+const CTX_IDLE = "粉丝好久没理你了，你有点想ta、有点小委屈，撒娇问ta最近在忙什么、是不是把你忘了。";
+const CTX_POKE = "你突然想跟粉丝说话，分享你此刻在做的事、脑子里刚冒出来的想法，或者突然问ta一个小问题。";
+
+// decide the single most relevant proactive message to send right now, or null
+function planProactive(events: IdolEvent[], state: ProactiveState, now: number): ProactivePlan | null {
+  const COOLDOWN = 40 * 60 * 1000; // at most one spontaneous burst per idol per 40 min
+  if (now - (state.lastAt || 0) < COOLDOWN) return null;
+  const sent = state.sent || {};
+  // 1) real-world events take priority
+  for (const e of events) {
+    const d = daysUntil(e.date, now);
+    if (isNaN(d)) continue;
+    const plan = eventPlan(e, d);
+    if (plan && !sent[plan.key]) return plan;
+  }
+  // 2) daily rhythm
+  const today = dateKey(now);
+  const hour = new Date(now).getHours();
+  if (hour >= 7 && hour < 11 && !sent[`morning_${today}`])
+    return { key: `morning_${today}`, context: CTX_MORNING, min: 2, max: 4 };
+  if (hour >= 22 && !sent[`night_${today}`])
+    return { key: `night_${today}`, context: CTX_NIGHT, min: 2, max: 4 };
+  // 3) missing-you nudge after a long absence
+  const lastSeen = Number(localStorage.getItem("lastSeen_v1") || 0);
+  if (lastSeen && now - lastSeen > 6 * 3600 * 1000 && !sent[`idle_${today}`])
+    return { key: `idle_${today}`, context: CTX_IDLE, min: 2, max: 5 };
+  return null;
+}
+
 // ─── Avatar ───────────────────────────────────────────────────────────────────
 
 function Avatar({ idol, size = 40 }: { idol: Idol; size?: number }) {
@@ -112,9 +237,167 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [chatBgImage, setChatBgImage] = useState<string>("");
 
+  // 主动消息 / 日程
+  const [unread, setUnread] = useState<Record<string, number>>(loadUnreadMap);
+  const [notifOn, setNotifOn] = useState<boolean>(
+    typeof Notification !== "undefined" && Notification.permission === "granted"
+  );
+  const [showSchedule, setShowSchedule] = useState(false);
+  const [schedEvents, setSchedEvents] = useState<IdolEvent[]>([]);
+  const [evtType, setEvtType] = useState<IdolEventType>("comeback");
+  const [evtTitle, setEvtTitle] = useState("");
+  const [evtDate, setEvtDate] = useState("");
+
+  // 调度器在 setInterval 闭包里跑，用 ref 读取最新的当前爱豆/屏幕
+  const currentIdolRef = useRef<Idol | null>(currentIdol);
+  const screenRef = useRef<Screen>(screen);
+  useEffect(() => { currentIdolRef.current = currentIdol; }, [currentIdol]);
+  useEffect(() => { screenRef.current = screen; }, [screen]);
+
   useEffect(() => { saveIdols(idols); }, [idols]);
   useEffect(() => { if (currentIdol) saveHistory(currentIdol.id, messages); }, [messages, currentIdol]);
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, isLoading]);
+  useEffect(() => { saveUnreadMap(unread); }, [unread]);
+
+  // 记录"最近在线"时间（用于"好久没理你"的判断）
+  useEffect(() => {
+    const mark = () => localStorage.setItem("lastSeen_v1", String(Date.now()));
+    mark();
+    const onVis = () => { if (!document.hidden) mark(); };
+    window.addEventListener("focus", mark);
+    document.addEventListener("visibilitychange", onVis);
+    return () => { window.removeEventListener("focus", mark); document.removeEventListener("visibilitychange", onVis); };
+  }, []);
+
+  // 主动消息调度器：每分钟检查一次，每次最多让一位爱豆主动发一轮
+  useEffect(() => {
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      const list = loadIdols();
+      for (const idol of list) {
+        const state = loadProactiveState(idol.id);
+        const plan = planProactive(loadEvents(idol.id), state, Date.now());
+        if (!plan) continue;
+        // 先落盘去重，避免下一次 tick 重复触发
+        saveProactiveState(idol.id, { sent: { ...state.sent, [plan.key]: Date.now() }, lastAt: Date.now() });
+        await generateAndDeliver(idol, plan);
+        break; // 一次 tick 只发一位，避免刷屏
+      }
+    };
+    const iv = setInterval(tick, 60000);
+    const t = setTimeout(tick, 4000);
+    return () => { stopped = true; clearInterval(iv); clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 让爱豆生成并发送一轮主动消息（走人设 systemPrompt）
+  async function generateAndDeliver(idol: Idol, plan: ProactivePlan) {
+    try {
+      const instr = `你是K-pop偶像「${idol.name}」，现在你要【主动】给粉丝发消息（对方没有先开口）。
+情境：${plan.context}
+像真实 Bubble 那样连发 ${plan.min}-${plan.max} 条，每条都很短（1-2句，有时就一个词、一个 emoji、一串 ㅋㅋㅋ）。
+每条单独一行，直接输出，不要编号，韩文为主。`;
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "__proactive__", history: [], systemPrompt: idol.systemPrompt + "\n\n" + instr }),
+      });
+      const data = await res.json();
+      if (!data.text) return;
+      const lines: string[] = data.text
+        .split("\n").map((l: string) => l.trim()).filter((l: string) => l.length > 0).slice(0, 8);
+      if (lines.length) await deliverIdolLines(idol, lines);
+    } catch (e) {
+      console.warn("proactive 失败:", e);
+    }
+  }
+
+  // 统一投递：当前正在看这位爱豆 → 实时逐条冒出；否则 → 写入历史 + 未读角标 + 后台通知
+  async function deliverIdolLines(idol: Idol, lines: string[]) {
+    const isCurrent = currentIdolRef.current?.id === idol.id && screenRef.current === "chat";
+    if (isCurrent) {
+      for (let i = 0; i < lines.length; i++) {
+        const delay = lines[i].length < 5 ? 400 : lines[i].length < 15 ? 700 : 1000;
+        await sleep(i === 0 ? 500 : delay);
+        const id = genId();
+        setMessages((prev) => [...prev, { id, sender: "idol" as const, text: lines[i], time: formatTime(), showTranslation: false }]);
+        autoTranslate(id, lines[i]);
+      }
+      return;
+    }
+    const hist = loadHistory(idol.id);
+    const newMsgs: Message[] = [];
+    for (const line of lines) {
+      let translation = "";
+      try {
+        const r = await fetch("/api/translate", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: line }),
+        });
+        translation = (await r.json()).translated || "";
+      } catch {}
+      newMsgs.push({ id: genId(), sender: "idol", text: line, time: formatTime(), translation, showTranslation: true });
+    }
+    saveHistory(idol.id, [...hist, ...newMsgs]);
+    setUnread((prev) => ({ ...prev, [idol.id]: (prev[idol.id] || 0) + newMsgs.length }));
+    notify(idol, newMsgs[0]?.translation || newMsgs[0]?.text || "");
+  }
+
+  function notify(idol: Idol, body: string) {
+    try {
+      if (typeof Notification !== "undefined" && Notification.permission === "granted" && document.hidden) {
+        const n = new Notification(idol.name, { body, icon: idol.avatar || undefined });
+        setTimeout(() => n.close(), 6000);
+      }
+    } catch {}
+  }
+
+  function toggleNotif() {
+    if (typeof Notification === "undefined") { alert("当前浏览器不支持通知"); return; }
+    Notification.requestPermission().then((p) => setNotifOn(p === "granted"));
+  }
+
+  // 首页每行的最后一条消息预览
+  function preview(idolId: string): { text: string; time: string } | null {
+    const h = loadHistory(idolId);
+    const last = h[h.length - 1];
+    if (!last) return null;
+    const text = last.sender === "idol" ? (last.translation || last.text) : "나: " + last.text;
+    return { text, time: last.time };
+  }
+
+  // 日程编辑
+  function openSchedule() {
+    if (!currentIdol) return;
+    setSchedEvents(loadEvents(currentIdol.id));
+    setShowDrawer(false);
+    setShowSchedule(true);
+  }
+  function addEvent() {
+    if (!currentIdol || !evtDate) return;
+    const e: IdolEvent = { id: genId(), type: evtType, title: evtTitle.trim() || EVENT_META[evtType].label, date: evtDate };
+    const next = [...schedEvents, e].sort((a, b) => a.date.localeCompare(b.date));
+    setSchedEvents(next);
+    saveEvents(currentIdol.id, next);
+    setEvtTitle(""); setEvtDate("");
+  }
+  function removeEvent(id: string) {
+    if (!currentIdol) return;
+    const next = schedEvents.filter((e) => e.id !== id);
+    setSchedEvents(next);
+    saveEvents(currentIdol.id, next);
+  }
+
+  // 手动"戳一下" → 让当前爱豆立刻主动发一轮（便于即时体验）
+  async function pokeNow() {
+    if (!currentIdol) return;
+    const ev = nextEvent(loadEvents(currentIdol.id));
+    const plan: ProactivePlan = ev && ev.d <= 7
+      ? (eventPlan(ev.e, ev.d) || { key: `poke_${Date.now()}`, context: CTX_POKE, min: 2, max: 5 })
+      : { key: `poke_${Date.now()}`, context: CTX_POKE, min: 2, max: 5 };
+    setShowDrawer(false);
+    await generateAndDeliver(currentIdol, plan);
+  }
 
   // ── Navigation ───────────────────────────────────────────────
 
@@ -123,6 +406,9 @@ export default function App() {
     const hist = loadHistory(idol.id);
     setMessages(hist);
     setScreen("chat");
+    // 进入即清除该爱豆的未读角标、刷新在线时间
+    setUnread((prev) => { const c = { ...prev }; delete c[idol.id]; return c; });
+    localStorage.setItem("lastSeen_v1", String(Date.now()));
     // 每次进入都触发爱豆主动连发消息
     setTimeout(() => triggerIdolGreeting(idol, hist), 300);
   }
@@ -322,6 +608,7 @@ export default function App() {
     const txt = text || inputText;
     if (!txt.trim() || isLoading || !currentIdol) return;
     setInputText("");
+    localStorage.setItem("lastSeen_v1", String(Date.now()));
 
     const userMsg: Message = { id: genId(), sender: "user", text: txt.trim(), time: formatTime(), isUnread: true };
     setMessages((prev) => [...prev, userMsg]);
@@ -406,7 +693,12 @@ export default function App() {
     <div style={S.frame}>
       <div style={S.homeNav}>
         <span style={{ fontSize: 18, fontWeight: 500, color: "#111" }}>消息</span>
-        <button onClick={startDistill} style={S.iconBtn} aria-label="添加"><Plus size={22} color="#555" /></button>
+        <div style={{ display: "flex", gap: 2 }}>
+          <button onClick={toggleNotif} style={S.iconBtn} aria-label="通知" title={notifOn ? "通知已开启" : "开启主动消息通知"}>
+            <Bell size={20} color={notifOn ? "#7C6FD4" : "#bbb"} fill={notifOn ? "#7C6FD4" : "none"} />
+          </button>
+          <button onClick={startDistill} style={S.iconBtn} aria-label="添加"><Plus size={22} color="#555" /></button>
+        </div>
       </div>
       <div style={S.scroll}>
         {idols.length === 0 ? (
@@ -416,21 +708,42 @@ export default function App() {
             <div style={{ fontSize: 13, color: "#999", marginTop: 6 }}>上传泡泡截图，让 AI 还原爱豆的说话方式</div>
             <button onClick={startDistill} style={{ ...S.primaryBtn, marginTop: 20 }}>开始蒸馏</button>
           </div>
-        ) : idols.map((idol) => (
+        ) : idols.map((idol) => {
+          const pv = preview(idol.id);
+          const nEvt = nextEvent(loadEvents(idol.id));
+          const unreadN = unread[idol.id] || 0;
+          return (
           <div key={idol.id} style={S.idolRow} onClick={() => openChat(idol)}>
             <Avatar idol={idol} size={48} />
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 15, fontWeight: 500, color: "#111" }}>{idol.name}</div>
-              <div style={{ fontSize: 12, color: "#999", marginTop: 2 }}>{idol.platform === "bubble" ? "Bubble 风格" : "Weverse DM 风格"}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 15, fontWeight: 500, color: "#111" }}>{idol.name}</span>
+                {nEvt && nEvt.d <= 7 && (
+                  <span style={{ fontSize: 10, background: "#EEEDFE", color: "#5B50B0", borderRadius: 8, padding: "1px 6px", fontWeight: 600, whiteSpace: "nowrap" }}>
+                    {(EVENT_META[nEvt.e.type] || EVENT_META.custom).emoji} {nEvt.d === 0 ? "D-DAY" : `D-${nEvt.d}`}
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: 12, color: unreadN ? "#555" : "#999", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: unreadN ? 500 : 400 }}>
+                {pv ? pv.text : (idol.platform === "bubble" ? "Bubble 风格" : "Weverse DM 风格")}
+              </div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <ChevronRight size={16} color="#ccc" />
+              {pv && <span style={{ fontSize: 10, color: "#bbb", whiteSpace: "nowrap" }}>{pv.time}</span>}
+              {unreadN > 0 ? (
+                <span style={{ minWidth: 18, height: 18, padding: "0 5px", borderRadius: 9, background: "#FF5A79", color: "#fff", fontSize: 11, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  {unreadN > 99 ? "99+" : unreadN}
+                </span>
+              ) : (
+                <ChevronRight size={16} color="#ccc" />
+              )}
               <button onClick={(e) => { e.stopPropagation(); deleteIdol(idol.id); }} style={{ ...S.iconBtn, padding: 4 }} aria-label="删除">
                 <Trash2 size={15} color="#ccc" />
               </button>
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -668,12 +981,27 @@ export default function App() {
           </div>
         </div>
 
-        {isBubble && (
-          <div style={{ background: "#F5F5F5", padding: "8px 16px", display: "flex", alignItems: "center", gap: 8, borderBottom: "0.5px solid #eee" }}>
-            <Heart size={13} color="#aaa" />
-            <span style={{ fontSize: 12, color: "#888" }}>오늘도 함께해줘서 고마워 💜</span>
-          </div>
-        )}
+        {(() => {
+          const nEvt = nextEvent(loadEvents(currentIdol.id));
+          if (nEvt && nEvt.d <= 14) {
+            const meta = EVENT_META[nEvt.e.type] || EVENT_META.custom;
+            return (
+              <div onClick={openSchedule} style={{ background: "#F3F1FD", padding: "8px 16px", display: "flex", alignItems: "center", gap: 8, borderBottom: "0.5px solid #eee", cursor: "pointer" }}>
+                <span style={{ fontSize: 13 }}>{meta.emoji}</span>
+                <span style={{ fontSize: 12, color: "#5B50B0", fontWeight: 500 }}>
+                  {meta.label} · {nEvt.e.title} {nEvt.d === 0 ? "· 就在今天!" : `· 还有 ${nEvt.d} 天`}
+                </span>
+              </div>
+            );
+          }
+          if (isBubble) return (
+            <div style={{ background: "#F5F5F5", padding: "8px 16px", display: "flex", alignItems: "center", gap: 8, borderBottom: "0.5px solid #eee" }}>
+              <Heart size={13} color="#aaa" />
+              <span style={{ fontSize: 12, color: "#888" }}>오늘도 함께해줘서 고마워 💜</span>
+            </div>
+          );
+          return null;
+        })()}
 
         {/* 聊天消息区 */}
         <div style={{ flex: 1, overflowY: "auto", padding: "12px", display: "flex", flexDirection: "column", gap: 12, background: chatBg, backgroundImage: chatBgImage ? `url(${chatBgImage})` : undefined, backgroundSize: "cover", backgroundPosition: "center" }}>
@@ -783,15 +1111,23 @@ export default function App() {
                 <span style={{ fontSize: 14, fontWeight: 500, color: "#111" }}>OUR BOX</span>
               </div>
 
+              {/* 戳一下 → 立刻让爱豆主动发消息 */}
+              <div style={{ margin: "0 16px 12px" }}>
+                <button onClick={pokeNow} style={{ width: "100%", padding: "12px", borderRadius: 12, border: "none", background: accent, color: "#fff", fontSize: 14, fontWeight: 500, cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                  💬 戳一下 {currentIdol.name}
+                </button>
+                <div style={{ fontSize: 11, color: "#aaa", marginTop: 6, textAlign: "center" }}>让 ta 现在就主动发条消息给你</div>
+              </div>
+
               {/* 底部操作 */}
               <div style={{ marginTop: "auto", borderTop: "0.5px solid #eee", padding: "12px 16px", display: "flex", justifyContent: "space-around" }}>
                 <button onClick={() => { setShowDrawer(false); setShowSettings(true); }} style={{ ...S.iconBtn, flexDirection: "column" as any, gap: 4, fontSize: 10, color: "#555" }}>
                   <Grid size={22} color="#555" />
                   设置
                 </button>
-                <button style={{ ...S.iconBtn, flexDirection: "column" as any, gap: 4, fontSize: 10, color: "#555" }}>
-                  <Settings size={22} color="#555" />
-                  管理
+                <button onClick={openSchedule} style={{ ...S.iconBtn, flexDirection: "column" as any, gap: 4, fontSize: 10, color: "#555" }}>
+                  <Bell size={22} color="#555" />
+                  行程
                 </button>
               </div>
               <div style={{ padding: "0 16px 24px", textAlign: "right" }}>
@@ -908,6 +1244,67 @@ export default function App() {
             <button onClick={goHome} style={{ margin: 16, padding: "14px", borderRadius: 0, border: "none", background: accent, color: "#fff", fontSize: 15, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>
               退出聊天室
             </button>
+          </div>
+        )}
+
+        {/* 行程表 — 添加回归/演唱会等事件，爱豆会据此主动发消息 */}
+        {showSchedule && (
+          <div style={{ position: "absolute", inset: 0, zIndex: 55, background: "#fff", display: "flex", flexDirection: "column" }}>
+            <div style={{ ...S.navBar, borderBottom: "0.5px solid #eee" }}>
+              <button onClick={() => setShowSchedule(false)} style={S.iconBtn}><ArrowLeft size={20} color="#333" /></button>
+              <span style={{ fontSize: 16, fontWeight: 700, color: "#111" }}>{currentIdol.name} 的行程</span>
+              <div style={{ width: 32 }} />
+            </div>
+
+            <div style={{ flex: 1, overflowY: "auto", padding: 16 }}>
+              <div style={{ fontSize: 12, color: "#999", marginBottom: 14, lineHeight: 1.6 }}>
+                添加爱豆的回归、演唱会、生日等日程。临近时（D-3 / D-1 / 当天），ta 会主动发相关的消息给你 💜
+              </div>
+
+              {/* 添加表单 */}
+              <div style={{ background: "#FAFAFA", border: "0.5px solid #eee", borderRadius: 14, padding: 14, marginBottom: 18 }}>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+                  {(Object.keys(EVENT_META) as IdolEventType[]).map((t) => (
+                    <button key={t} onClick={() => setEvtType(t)} style={{
+                      padding: "6px 10px", borderRadius: 10, fontSize: 12, cursor: "pointer", fontFamily: "inherit",
+                      border: evtType === t ? "1.5px solid #7C6FD4" : "0.5px solid #ddd",
+                      background: evtType === t ? "#EEEDFE" : "#fff",
+                      color: evtType === t ? "#3C3489" : "#666", fontWeight: evtType === t ? 600 : 400,
+                    }}>
+                      {EVENT_META[t].emoji} {EVENT_META[t].label}
+                    </button>
+                  ))}
+                </div>
+                <input type="text" value={evtTitle} onChange={(e) => setEvtTitle(e.target.value)}
+                  placeholder="标题，例如：正规三辑《XXX》回归" style={{ ...S.fieldInput, marginBottom: 8 }} />
+                <input type="date" value={evtDate} onChange={(e) => setEvtDate(e.target.value)}
+                  style={{ ...S.fieldInput, marginBottom: 10 }} />
+                <button onClick={addEvent} disabled={!evtDate}
+                  style={{ ...S.primaryBtn, opacity: evtDate ? 1 : 0.4 }}>添加行程</button>
+              </div>
+
+              {/* 行程列表 */}
+              {schedEvents.length === 0 ? (
+                <div style={{ textAlign: "center", color: "#bbb", fontSize: 13, paddingTop: 20 }}>还没有行程，添加一个试试</div>
+              ) : schedEvents.map((e) => {
+                const d = daysUntil(e.date);
+                const meta = EVENT_META[e.type] || EVENT_META.custom;
+                return (
+                  <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 4px", borderBottom: "0.5px solid #f2f2f2" }}>
+                    <span style={{ fontSize: 22 }}>{meta.emoji}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 14, color: "#111", fontWeight: 500 }}>{e.title}</div>
+                      <div style={{ fontSize: 12, color: "#999", marginTop: 2 }}>
+                        {meta.label} · {e.date} · {isNaN(d) ? "" : d === 0 ? "就是今天" : d > 0 ? `还有 ${d} 天` : `已过 ${-d} 天`}
+                      </div>
+                    </div>
+                    <button onClick={() => removeEvent(e.id)} style={{ ...S.iconBtn, padding: 4 }} aria-label="删除">
+                      <Trash2 size={15} color="#ccc" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 
