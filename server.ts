@@ -280,6 +280,52 @@ ${text}
     }
   });
 
+  // ── /api/instagram ─────────────────────────────────────────
+  // 从可配置数据源读取某 IG 用户的最新帖（IG 无官方读取途径，见 api/instagram.ts 注释）
+  app.post("/api/instagram", async (req, res) => {
+    const stripHtml = (s: string) => s.replace(/<[^>]+>/g, " ").replace(/&[a-z]+;/gi, " ").replace(/\s+/g, " ").trim();
+    const firstImg = (html: string) => { const m = html.match(/<img[^>]+src=["']([^"']+)["']/i); return m ? m[1] : undefined; };
+    const parseHandle = (raw: string) => {
+      let h = String(raw).trim().replace(/^@/, "");
+      const m = h.match(/instagram\.com\/([^/?#]+)/i);
+      if (m) h = m[1];
+      return h.replace(/\/+$/, "");
+    };
+    const buildUrl = (user: string): string | null => {
+      const tmpl = process.env.IG_FEED_TEMPLATE;
+      if (tmpl) return tmpl.replace(/\{user\}/g, encodeURIComponent(user));
+      const base = process.env.IG_BRIDGE_BASE;
+      if (base) return `${base.replace(/\/$/, "")}/?action=display&bridge=Instagram&context=Username&u=${encodeURIComponent(user)}&format=Json`;
+      return null;
+    };
+    try {
+      const { handle } = req.body;
+      if (!handle) return res.status(400).json({ error: "缺少 handle" });
+      const user = parseHandle(handle);
+      const url = buildUrl(user);
+      if (!url) return res.json({ posts: [], note: "未配置 IG 数据源，请设置 IG_BRIDGE_BASE 或 IG_FEED_TEMPLATE" });
+
+      const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; BubbleDM/1.0)" } });
+      if (!r.ok) return res.json({ posts: [], note: `数据源返回 ${r.status}` });
+      const data: any = await r.json().catch(() => ({}));
+      const items: any[] = Array.isArray(data.items) ? data.items : [];
+      const posts = items.slice(0, 10).map((it) => {
+        const html = it.content_html || it.content || "";
+        return {
+          id: String(it.uri || it.url || it.id || it.timestamp || ""),
+          url: it.uri || it.url || "",
+          caption: stripHtml(it.title || it.content_text || html || "").slice(0, 500),
+          imageUrl: firstImg(html) || it.image || undefined,
+          timestamp: it.timestamp || null,
+        };
+      }).filter((p) => p.id);
+      res.json({ posts });
+    } catch (err: any) {
+      console.error("/api/instagram error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── Vite / Static ──────────────────────────────────────────
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

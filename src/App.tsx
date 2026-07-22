@@ -18,6 +18,7 @@ interface Idol {
   systemPrompt: string;
   createdAt: number;
   realName?: string; // 现实原型艺名/组合名，用于自动获取行程
+  instagram?: string; // IG 用户名/主页链接，用于同步新帖
 }
 
 interface Message {
@@ -28,6 +29,7 @@ interface Message {
   isUnread?: boolean;
   translation?: string;
   showTranslation?: boolean;
+  image?: string; // 图片消息（如同步过来的 IG 照片）
 }
 
 type Screen = "home" | "distill" | "progress" | "chat";
@@ -253,6 +255,9 @@ export default function App() {
   const [fetching, setFetching] = useState(false);
   const [suggestions, setSuggestions] = useState<IdolEvent[]>([]);
   const [setupRealName, setSetupRealName] = useState("");
+  // IG 同步
+  const [igHandle, setIgHandle] = useState("");
+  const [igSyncing, setIgSyncing] = useState(false);
 
   // 调度器在 setInterval 闭包里跑，用 ref 读取最新的当前爱豆/屏幕
   const currentIdolRef = useRef<Idol | null>(currentIdol);
@@ -296,6 +301,70 @@ export default function App() {
     return () => { stopped = true; clearInterval(iv); clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // IG 同步轮询：每 5 分钟检查关注爱豆的新帖，有新帖就当消息发过来
+  useEffect(() => {
+    let stopped = false;
+    const check = async () => {
+      if (stopped) return;
+      for (const idol of loadIdols()) {
+        if (!idol.instagram) continue;
+        await syncIgForIdol(idol);
+      }
+    };
+    const iv = setInterval(check, 5 * 60 * 1000);
+    const t = setTimeout(check, 8000);
+    return () => { stopped = true; clearInterval(iv); clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 拉取某爱豆 IG 新帖并投递；首次只记录基线，避免把历史帖一次性全灌进来
+  async function syncIgForIdol(idol: Idol): Promise<number> {
+    if (!idol.instagram) return 0;
+    try {
+      const r = await fetch("/api/instagram", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ handle: idol.instagram }),
+      });
+      const d = await r.json();
+      const posts: any[] = d.posts || [];
+      if (!posts.length) return 0;
+      const key = `ig_last_${idol.id}`;
+      const lastSeen = localStorage.getItem(key) || "";
+      if (!lastSeen) { localStorage.setItem(key, posts[0].id); return 0; } // 基线
+      const fresh: any[] = [];
+      for (const p of posts) { if (p.id === lastSeen) break; fresh.push(p); }
+      for (const p of fresh.reverse()) await deliverIgPost(idol, p);
+      localStorage.setItem(key, posts[0].id);
+      return fresh.length;
+    } catch {
+      return 0;
+    }
+  }
+
+  // 把一条 IG 帖当作爱豆消息投递（照片 + 文案 + 中文翻译）
+  async function deliverIgPost(idol: Idol, post: { id: string; imageUrl?: string; caption?: string; url?: string }) {
+    let translation = "";
+    if (post.caption) {
+      try {
+        const r = await fetch("/api/translate", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: post.caption }),
+        });
+        translation = (await r.json()).translated || "";
+      } catch {}
+    }
+    const msg: Message = {
+      id: genId(), sender: "idol", text: post.caption || "📸", time: formatTime(),
+      image: post.imageUrl, translation, showTranslation: !!translation,
+    };
+    const isCurrent = currentIdolRef.current?.id === idol.id && screenRef.current === "chat";
+    if (isCurrent) {
+      setMessages((prev) => [...prev, msg]);
+    } else {
+      saveHistory(idol.id, [...loadHistory(idol.id), msg]);
+      setUnread((prev) => ({ ...prev, [idol.id]: (prev[idol.id] || 0) + 1 }));
+      notify(idol, translation || post.caption || "发了新照片 📸");
+    }
+  }
 
   // 让爱豆生成并发送一轮主动消息（走人设 systemPrompt）
   async function generateAndDeliver(idol: Idol, plan: ProactivePlan) {
@@ -377,9 +446,44 @@ export default function App() {
     if (!currentIdol) return;
     setSchedEvents(loadEvents(currentIdol.id));
     setFetchName(currentIdol.realName || currentIdol.name);
+    setIgHandle(currentIdol.instagram || "");
     setSuggestions([]);
     setShowDrawer(false);
     setShowSchedule(true);
+  }
+
+  // 连接/更新 IG 账号
+  function saveIgHandle() {
+    if (!currentIdol) return;
+    const h = igHandle.trim();
+    const updated = { ...currentIdol, instagram: h || undefined };
+    setIdols((prev) => prev.map((i) => (i.id === currentIdol.id ? updated : i)));
+    setCurrentIdol(updated);
+    if (!h) localStorage.removeItem(`ig_last_${currentIdol.id}`);
+  }
+
+  // 立即同步一次（拉最新一条作演示，并把它设为基线）
+  async function syncIgNow() {
+    if (!currentIdol || !igHandle.trim()) return;
+    const updated = { ...currentIdol, instagram: igHandle.trim() };
+    setIdols((prev) => prev.map((i) => (i.id === currentIdol.id ? updated : i)));
+    setCurrentIdol(updated);
+    setIgSyncing(true);
+    try {
+      const r = await fetch("/api/instagram", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ handle: updated.instagram }),
+      });
+      const d = await r.json();
+      const posts: any[] = d.posts || [];
+      if (!posts.length) { alert(d.note || "没抓到帖子。可能是数据源(IG_BRIDGE_BASE)没配好，或该账号读不到。"); return; }
+      await deliverIgPost(updated, posts[0]);
+      localStorage.setItem(`ig_last_${currentIdol.id}`, posts[0].id);
+      alert("已同步最新一条 📸 之后有新帖会自动发给你");
+    } catch {
+      alert("同步失败，请稍后再试。");
+    } finally {
+      setIgSyncing(false);
+    }
   }
 
   // 自动从日程源抓取该艺人的近期事件（结果作为"建议"，需一键导入）
@@ -1075,8 +1179,15 @@ export default function App() {
                     </div>
                   )}
                   <div style={{ display: "flex", alignItems: "flex-end", gap: 6 }}>
-                    <div style={{ background: idolBg, color: "#111", padding: "10px 14px", borderRadius: "4px 18px 18px 18px", fontSize: 14, lineHeight: 1.55, border: isBubble ? "0.5px solid #eee" : "none", maxWidth: 240, boxShadow: isBubble ? "0 1px 2px rgba(0,0,0,0.06)" : "none" }}>
-                      {msg.showTranslation === false ? msg.text : (msg.translation || msg.text)}
+                    <div style={{ background: idolBg, color: "#111", padding: msg.image ? "6px 6px 10px" : "10px 14px", borderRadius: "4px 18px 18px 18px", fontSize: 14, lineHeight: 1.55, border: isBubble ? "0.5px solid #eee" : "none", maxWidth: 240, boxShadow: isBubble ? "0 1px 2px rgba(0,0,0,0.06)" : "none" }}>
+                      {msg.image && (
+                        <img src={msg.image} alt="" style={{ width: "100%", maxWidth: 220, borderRadius: 12, display: "block", marginBottom: msg.text ? 8 : 0 }} />
+                      )}
+                      {msg.text && (
+                        <div style={{ padding: msg.image ? "0 8px" : 0 }}>
+                          {msg.showTranslation === false ? msg.text : (msg.translation || msg.text)}
+                        </div>
+                      )}
                     </div>
                     <span style={{ fontSize: 10, color: "#bbb", whiteSpace: "nowrap", paddingBottom: 2 }}>{msg.time}</span>
                     {/* A 翻译圆形按钮 */}
@@ -1354,6 +1465,22 @@ export default function App() {
                     })}
                   </div>
                 )}
+              </div>
+
+              {/* Instagram 同步 */}
+              <div style={{ background: "#FFF3F8", border: "0.5px solid #FAD9E8", borderRadius: 14, padding: 14, marginBottom: 18 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#C13B7A", marginBottom: 8 }}>📸 Instagram 同步</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input type="text" value={igHandle} onChange={(e) => setIgHandle(e.target.value)} onBlur={saveIgHandle}
+                    placeholder="爱豆 IG 主页链接或 @用户名" style={{ ...S.fieldInput, flex: 1 }} />
+                  <button onClick={syncIgNow} disabled={igSyncing || !igHandle.trim()}
+                    style={{ padding: "0 16px", borderRadius: 12, border: "none", background: igSyncing || !igHandle.trim() ? "#ddd" : "#E7568F", color: "#fff", fontSize: 13, fontWeight: 500, cursor: igSyncing ? "wait" : "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+                    {igSyncing ? "同步中…" : "立即同步"}
+                  </button>
+                </div>
+                <div style={{ fontSize: 11, color: "#c98aa9", marginTop: 6, lineHeight: 1.5 }}>
+                  连接后，ta 一更新 IG，照片和文案会自动同步成消息发给你（App 开着时约 5 分钟内）。需在部署时配置 IG 数据源（见 README）。
+                </div>
               </div>
 
               {/* 手动添加表单 */}
