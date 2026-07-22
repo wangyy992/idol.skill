@@ -19,6 +19,7 @@ interface Idol {
   createdAt: number;
   realName?: string; // 现实原型艺名/组合名，用于自动获取行程
   instagram?: string; // IG 用户名/主页链接，用于同步新帖
+  habits?: IdolHabits; // 作息 / 发消息习惯
 }
 
 interface Message {
@@ -83,6 +84,50 @@ const EVENT_META: Record<IdolEventType, { label: string; emoji: string }> = {
   variety: { label: "综艺/直播", emoji: "📺" },
   custom: { label: "日程", emoji: "📌" },
 };
+
+// ── 作息 / 发消息习惯 ──────────────────────────────────────────────────────────
+
+interface IdolHabits {
+  wakeHour: number;         // 起床时间（0-23）→ 早安消息窗口
+  sleepHour: number;        // 睡觉时间（0-23）→ 晚安消息窗口
+  activeBuckets: string[];  // 爱发消息的时段（TIME_BUCKETS 的 id）
+  burstMin: number;         // 每次发几句（下限）
+  burstMax: number;         // 每次发几句（上限）
+  chattiness: "low" | "med" | "high"; // 话痨程度
+}
+
+const TIME_BUCKETS: { id: string; label: string; hours: number[] }[] = [
+  { id: "dawn", label: "清晨", hours: [6, 7, 8] },
+  { id: "morning", label: "上午", hours: [9, 10, 11] },
+  { id: "noon", label: "中午", hours: [12, 13] },
+  { id: "afternoon", label: "下午", hours: [14, 15, 16, 17] },
+  { id: "evening", label: "傍晚", hours: [18, 19] },
+  { id: "night", label: "晚上", hours: [20, 21, 22] },
+  { id: "latenight", label: "深夜", hours: [23, 0, 1] },
+];
+
+function defaultHabits(): IdolHabits {
+  return { wakeHour: 9, sleepHour: 0, activeBuckets: ["noon", "night"], burstMin: 2, burstMax: 5, chattiness: "med" };
+}
+
+function habitsActiveHours(h: IdolHabits): number[] {
+  const set = new Set<number>();
+  for (const id of h.activeBuckets) {
+    const b = TIME_BUCKETS.find((x) => x.id === id);
+    if (b) b.hours.forEach((hr) => set.add(hr));
+  }
+  return [...set];
+}
+
+// hour 是否落在以 start 起、长 len 小时的窗口内（跨午夜安全）
+function inHourWindow(hour: number, start: number, len = 2): boolean {
+  for (let i = 0; i < len; i++) if ((start + i) % 24 === hour) return true;
+  return false;
+}
+
+function chattinessProb(c: IdolHabits["chattiness"]): number {
+  return c === "high" ? 0.7 : c === "low" ? 0.2 : 0.4;
+}
 
 function loadEvents(idolId: string): IdolEvent[] {
   try { return JSON.parse(localStorage.getItem(`events_${idolId}`) || "[]"); }
@@ -162,29 +207,41 @@ const CTX_NIGHT = "现在是深夜，你准备睡了，跟粉丝道晚安，说�
 const CTX_IDLE = "粉丝好久没理你了，你有点想ta、有点小委屈，撒娇问ta最近在忙什么、是不是把你忘了。";
 const CTX_POKE = "你突然想跟粉丝说话，分享你此刻在做的事、脑子里刚冒出来的想法，或者突然问ta一个小问题。";
 
-// decide the single most relevant proactive message to send right now, or null
-function planProactive(events: IdolEvent[], state: ProactiveState, now: number): ProactivePlan | null {
-  const COOLDOWN = 40 * 60 * 1000; // at most one spontaneous burst per idol per 40 min
+// decide the single most relevant proactive message to send right now, or null.
+// 全部按这位爱豆的作息 habits 来：起床/睡觉时间、爱发消息的时段、每次几句、话痨度
+function planProactive(events: IdolEvent[], habits: IdolHabits, state: ProactiveState, now: number): ProactivePlan | null {
+  const COOLDOWN = 40 * 60 * 1000; // 同一位爱豆两轮主动消息至少间隔 40 分钟
   if (now - (state.lastAt || 0) < COOLDOWN) return null;
   const sent = state.sent || {};
-  // 1) real-world events take priority
+  const min = Math.max(1, habits.burstMin);
+  const max = Math.max(min, habits.burstMax);
+
+  // 1) 现实事件优先（回归/演唱会…），条数也按她的习惯
   for (const e of events) {
     const d = daysUntil(e.date, now);
     if (isNaN(d)) continue;
     const plan = eventPlan(e, d);
-    if (plan && !sent[plan.key]) return plan;
+    if (plan && !sent[plan.key]) return { ...plan, min, max };
   }
-  // 2) daily rhythm
+
   const today = dateKey(now);
   const hour = new Date(now).getHours();
-  if (hour >= 7 && hour < 11 && !sent[`morning_${today}`])
-    return { key: `morning_${today}`, context: CTX_MORNING, min: 2, max: 4 };
-  if (hour >= 22 && !sent[`night_${today}`])
-    return { key: `night_${today}`, context: CTX_NIGHT, min: 2, max: 4 };
-  // 3) missing-you nudge after a long absence
+
+  // 2) 起床 → 早安；睡前 → 晚安（按她设定的时间，跨午夜安全）
+  if (inHourWindow(hour, habits.wakeHour) && !sent[`morning_${today}`])
+    return { key: `morning_${today}`, context: CTX_MORNING, min, max };
+  if (inHourWindow(hour, habits.sleepHour) && !sent[`night_${today}`])
+    return { key: `night_${today}`, context: CTX_NIGHT, min, max };
+
+  // 3) 在她"爱发消息的时段"里，按话痨程度随机冒出来
+  if (habitsActiveHours(habits).includes(hour) && !sent[`spont_${today}_${hour}`] && Math.random() < chattinessProb(habits.chattiness))
+    return { key: `spont_${today}_${hour}`, context: CTX_POKE, min, max };
+
+  // 4) 好久没理她 → 撒娇
   const lastSeen = Number(localStorage.getItem("lastSeen_v1") || 0);
   if (lastSeen && now - lastSeen > 6 * 3600 * 1000 && !sent[`idle_${today}`])
-    return { key: `idle_${today}`, context: CTX_IDLE, min: 2, max: 5 };
+    return { key: `idle_${today}`, context: CTX_IDLE, min, max };
+
   return null;
 }
 
@@ -258,6 +315,8 @@ export default function App() {
   // IG 同步
   const [igHandle, setIgHandle] = useState("");
   const [igSyncing, setIgSyncing] = useState(false);
+  // 作息习惯（编辑中）
+  const [habits, setHabits] = useState<IdolHabits>(defaultHabits());
 
   // 调度器在 setInterval 闭包里跑，用 ref 读取最新的当前爱豆/屏幕
   const currentIdolRef = useRef<Idol | null>(currentIdol);
@@ -288,7 +347,7 @@ export default function App() {
       const list = loadIdols();
       for (const idol of list) {
         const state = loadProactiveState(idol.id);
-        const plan = planProactive(loadEvents(idol.id), state, Date.now());
+        const plan = planProactive(loadEvents(idol.id), idol.habits || defaultHabits(), state, Date.now());
         if (!plan) continue;
         // 先落盘去重，避免下一次 tick 重复触发
         saveProactiveState(idol.id, { sent: { ...state.sent, [plan.key]: Date.now() }, lastAt: Date.now() });
@@ -452,6 +511,20 @@ export default function App() {
     setShowSchedule(true);
   }
 
+  // 打开设置时载入这位爱豆的作息
+  function openSettings() {
+    if (currentIdol) setHabits(currentIdol.habits || defaultHabits());
+    setShowDrawer(false);
+    setShowSettings(true);
+  }
+  function saveHabits(next: IdolHabits) {
+    setHabits(next);
+    if (!currentIdol) return;
+    const updated = { ...currentIdol, habits: next };
+    setIdols((prev) => prev.map((i) => (i.id === currentIdol.id ? updated : i)));
+    setCurrentIdol(updated);
+  }
+
   // 连接/更新 IG 账号
   function saveIgHandle() {
     if (!currentIdol) return;
@@ -544,10 +617,12 @@ export default function App() {
   // 手动"戳一下" → 让当前爱豆立刻主动发一轮（便于即时体验）
   async function pokeNow() {
     if (!currentIdol) return;
+    const h = currentIdol.habits || defaultHabits();
     const ev = nextEvent(loadEvents(currentIdol.id));
-    const plan: ProactivePlan = ev && ev.d <= 7
-      ? (eventPlan(ev.e, ev.d) || { key: `poke_${Date.now()}`, context: CTX_POKE, min: 2, max: 5 })
-      : { key: `poke_${Date.now()}`, context: CTX_POKE, min: 2, max: 5 };
+    const base = ev && ev.d <= 7 ? eventPlan(ev.e, ev.d) : null;
+    const plan: ProactivePlan = base
+      ? { ...base, min: h.burstMin, max: h.burstMax }
+      : { key: `poke_${Date.now()}`, context: CTX_POKE, min: h.burstMin, max: h.burstMax };
     setShowDrawer(false);
     await generateAndDeliver(currentIdol, plan);
   }
@@ -570,14 +645,15 @@ export default function App() {
     const todayKey = `greeting_${idol.id}_${new Date().toDateString()}`;
     const alreadySent = localStorage.getItem(todayKey);
 
+    const h = idol.habits || defaultHabits();
     const prompt = alreadySent
       ? `你是K-pop偶像「${idol.name}」，粉丝刚刚打开了你的专属频道。
 你们今天已经聊过了，现在是再次上线。
-像真实 Bubble 那样连续发消息，发5-10条，每条都很短（1-2句），有的就是一个emoji或一个感叹词。
+像真实 Bubble 那样连续发消息，发 ${h.burstMin}-${h.burstMax} 条，每条都很短（1-2句），有的就是一个emoji或一个感叹词。
 表达看到粉丝在线的开心，随便聊聊你现在在做什么。
 每条消息单独一行，直接输出，不要编号，韩文为主。`
       : `你是K-pop偶像「${idol.name}」，粉丝刚打开你的专属频道。
-像真实 Bubble 那样疯狂连发消息，发10-20条，每条都极短（有时就一个词、一个emoji、一串ㅋㅋㅋ）。
+像真实 Bubble 那样连发消息，发 ${h.burstMin + 1}-${h.burstMax + 3} 条，每条都极短（有时就一个词、一个emoji、一串ㅋㅋㅋ）。
 内容随意自然：打招呼、问粉丝在干嘛、说说你今天发生的事、突然问一个问题、发个无厘头的感叹。
 节奏要有真实感，像人在手机上一条一条快速发。
 每条消息单独一行，直接输出，不要编号，韩文为主。`;
@@ -752,6 +828,7 @@ export default function App() {
       systemPrompt: pendingSystemPrompt,
       createdAt: Date.now(),
       realName: setupRealName.trim() || undefined,
+      habits: defaultHabits(),
     };
     setIdols((prev) => [idol, ...prev]);
     openChat(idol);
@@ -1289,7 +1366,7 @@ export default function App() {
 
               {/* 底部操作 */}
               <div style={{ marginTop: "auto", borderTop: "0.5px solid #eee", padding: "12px 16px", display: "flex", justifyContent: "space-around" }}>
-                <button onClick={() => { setShowDrawer(false); setShowSettings(true); }} style={{ ...S.iconBtn, flexDirection: "column" as any, gap: 4, fontSize: 10, color: "#555" }}>
+                <button onClick={openSettings} style={{ ...S.iconBtn, flexDirection: "column" as any, gap: 4, fontSize: 10, color: "#555" }}>
                   <Grid size={22} color="#555" />
                   设置
                 </button>
@@ -1315,6 +1392,64 @@ export default function App() {
             </div>
 
             <div style={{ flex: 1, overflowY: "auto" }}>
+              {/* 作息 · 发消息习惯 */}
+              <div style={{ padding: 16, borderBottom: "8px solid #f5f5f5" }}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: "#111", marginBottom: 4 }}>作息 · 发消息习惯</div>
+                <div style={{ fontSize: 11, color: "#aaa", marginBottom: 16, lineHeight: 1.5 }}>ta 会照这些习惯主动给你发泡泡——越贴近真人，越像她本人 💜</div>
+
+                <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+                  <label style={{ flex: 1 }}>
+                    <div style={S.label}>🌅 起床时间</div>
+                    <select value={habits.wakeHour} onChange={(e) => saveHabits({ ...habits, wakeHour: Number(e.target.value) })} style={S.fieldInput}>
+                      {Array.from({ length: 24 }, (_, i) => i).map((h) => <option key={h} value={h}>{String(h).padStart(2, "0")}:00</option>)}
+                    </select>
+                  </label>
+                  <label style={{ flex: 1 }}>
+                    <div style={S.label}>🌙 睡觉时间</div>
+                    <select value={habits.sleepHour} onChange={(e) => saveHabits({ ...habits, sleepHour: Number(e.target.value) })} style={S.fieldInput}>
+                      {Array.from({ length: 24 }, (_, i) => i).map((h) => <option key={h} value={h}>{String(h).padStart(2, "0")}:00</option>)}
+                    </select>
+                  </label>
+                </div>
+
+                <div style={{ marginBottom: 16 }}>
+                  <div style={S.label}>💬 爱发消息的时段（可多选）</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {TIME_BUCKETS.map((b) => {
+                      const on = habits.activeBuckets.includes(b.id);
+                      return (
+                        <button key={b.id} onClick={() => saveHabits({ ...habits, activeBuckets: on ? habits.activeBuckets.filter((x) => x !== b.id) : [...habits.activeBuckets, b.id] })}
+                          style={{ padding: "6px 12px", borderRadius: 16, fontSize: 12, cursor: "pointer", fontFamily: "inherit", border: on ? `1.5px solid ${accent}` : "0.5px solid #ddd", background: on ? "#EEEDFE" : "#fff", color: on ? "#3C3489" : "#666", fontWeight: on ? 600 : 400 }}>
+                          {b.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div style={{ marginBottom: 16 }}>
+                  <div style={S.label}>✍️ 每次发几句</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <input type="number" min={1} max={20} value={habits.burstMin} onChange={(e) => saveHabits({ ...habits, burstMin: Math.max(1, Number(e.target.value) || 1) })} style={{ ...S.fieldInput, width: 64 }} />
+                    <span style={{ color: "#999" }}>~</span>
+                    <input type="number" min={1} max={20} value={habits.burstMax} onChange={(e) => saveHabits({ ...habits, burstMax: Math.max(1, Number(e.target.value) || 1) })} style={{ ...S.fieldInput, width: 64 }} />
+                    <span style={{ fontSize: 12, color: "#999" }}>句</span>
+                  </div>
+                </div>
+
+                <div>
+                  <div style={S.label}>🗯️ 话痨程度</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    {([["low", "文静"], ["med", "适中"], ["high", "话痨"]] as const).map(([v, label]) => (
+                      <button key={v} onClick={() => saveHabits({ ...habits, chattiness: v })}
+                        style={{ flex: 1, padding: "9px", borderRadius: 10, fontSize: 12, cursor: "pointer", fontFamily: "inherit", border: habits.chattiness === v ? `1.5px solid ${accent}` : "0.5px solid #ddd", background: habits.chattiness === v ? "#EEEDFE" : "#fff", color: habits.chattiness === v ? "#3C3489" : "#666", fontWeight: habits.chattiness === v ? 600 : 400 }}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
               {/* 聊天室名称 */}
               <div style={S.settingRow}>
                 <span style={S.settingLabel}>聊天室名称</span>
